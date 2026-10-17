@@ -412,7 +412,8 @@ class Sdk002IdentityRaceTest {
             // The response alone is insufficient: save is suspended and publication has
             // not happened. A callback/receipt at this point would be a false positive.
             assertTrue(saveEntered.isCompleted)
-            assertTrue(auth.currentSessionOrNull() == before && saved == before)
+            assertIs<SessionStatus.RefreshFailure>(auth.sessionStatus.value)
+            assertTrue(storage.loadSessionOrNull() == before && saved == before)
             assertFalse(callback.isCompleted)
             assertTrue(receipt?.isCompleted != true)
             val observationTime = testScheduler.currentTime
@@ -457,7 +458,7 @@ class Sdk002IdentityRaceTest {
             }
             runCurrent()
             assertTrue(testScheduler.currentTime == observationTime)
-            assertTrue(saves == if (boundary == RecoveryBoundary.LATER_REFRESH) 3 else 2)
+            assertTrue(saves == if (boundary in listOf(RecoveryBoundary.JOB_REPLACEMENT, RecoveryBoundary.LATER_REFRESH)) 3 else 2)
             assertTrue(requests == if (boundary in listOf(RecoveryBoundary.RETRY, RecoveryBoundary.NETWORK_RETRY, RecoveryBoundary.PENDING_AGAIN, RecoveryBoundary.LATER_REFRESH)) 2 else 1)
             if (receipt != null) assertTrue(receipt.await() === committed)
             else assertTrue(callbacks == 1 && callback.await().delivered == refreshed)
@@ -882,6 +883,8 @@ class Sdk002IdentityRaceTest {
         val storage = MemorySessionManager()
         val requestEntered = CompletableDeferred<String?>()
         val releaseResponse = CompletableDeferred<Unit>()
+        val logoutEntered = CompletableDeferred<Unit>()
+        val logoutResponseReturned = CompletableDeferred<Unit>()
         var updates = 0
         var refreshes = 0
         var logouts = 0
@@ -913,7 +916,9 @@ class Sdk002IdentityRaceTest {
                     assertTrue(boundary == UpdateBoundary.SIGN_OUT || boundary == UpdateBoundary.RELOGIN)
                     assertTrue(request.headers["Authorization"] == "Bearer ${a.accessToken}")
                     logouts++
+                    logoutEntered.complete(Unit)
                     respondJson("{}")
+                    logoutResponseReturned.complete(Unit)
                 }
                 else -> error("Unexpected request in user-update boundary test")
             }
@@ -932,7 +937,9 @@ class Sdk002IdentityRaceTest {
                 UpdateBoundary.SIGN_OUT, UpdateBoundary.RELOGIN -> {
                     val logout = async { client.auth.signOut() }
                     runCurrent()
-                    assertTrue(logout.isCompleted)
+                    assertTrue(logoutEntered.isCompleted, "signOut did not enter /logout handler; responseReturned=${logoutResponseReturned.isCompleted}, completed=${logout.isCompleted}")
+                    assertTrue(logoutResponseReturned.isCompleted, " /logout handler did not return its response; completed=${logout.isCompleted}")
+                    assertTrue(logout.isCompleted, "/logout response returned but signOut is still suspended")
                     logout.await()
                     assertNull(client.auth.currentSessionOrNull())
                     assertNull(storage.loadSessionOrNull())
