@@ -161,14 +161,14 @@ internal class AuthImpl(
                 logger.i {
                     "Loading session from storage..."
                 }
-                val successful = loadFromStorage(initializing = true)
-                if (successful) {
+                val sessionFound = loadFromStorage(initializing = true)
+                if (sessionFound) {
                     logger.i {
-                        "Successfully loaded session from storage!"
+                        "Found session data in storage."
                     }
                 } else {
                     logger.i {
-                        "No session found in storage."
+                        "No session data was read from storage."
                     }
                 }
                 if(config.autoSetupPlatform) {
@@ -762,15 +762,31 @@ internal class AuthImpl(
     override suspend fun loadFromStorage(autoRefresh: Boolean): Boolean = loadFromStorage(autoRefresh, false)
 
     suspend fun loadFromStorage(autoRefresh: Boolean = config.alwaysAutoRefresh, initializing: Boolean): Boolean {
+        val generation = sessionMutex.withLock {
+            // Initialization may not start until after another operation has
+            // already established (or is importing) the authoritative session.
+            if (initializing && (sessionStatus.value !is SessionStatus.Initializing || sessionImportPending)) {
+                logger.d { "Skipping storage initialization because session authority has already changed." }
+                return false
+            }
+            sessionGeneration.load()
+        }
         val session = try { sessionManager.loadSession() } catch (e: Exception) {
             currentCoroutineContext().ensureActive()
             logger.e(e) { "Failed to load session" }
             null
+        } ?: return false
+        val job = sessionMutex.withLock {
+            if (sessionGeneration.load() !== generation) {
+                logger.d { "Ignoring stored session because session authority changed during the read." }
+                return@withLock null
+            }
+            importSessionLocked(session, autoRefresh, SessionSource.Storage)
         }
-        session?.let {
-            importSession(it, autoRefresh, SessionSource.Storage, initializing)
-        }
-        return session != null
+        // Keep initialization's job-waiting behavior outside the commit lock.
+        if (initializing) job?.join()
+        // This reports finding stored data, not whether it was still authoritative.
+        return true
     }
 
     override suspend fun close() {

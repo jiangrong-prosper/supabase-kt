@@ -1,4 +1,5 @@
 import io.github.jan.supabase.auth.Auth
+import io.github.jan.supabase.auth.AuthImpl
 import io.github.jan.supabase.auth.MemorySessionManager
 import io.github.jan.supabase.auth.SessionManager
 import io.github.jan.supabase.auth.SignOutScope
@@ -347,6 +348,168 @@ class AuthRefreshAuthorityTest {
             assertTrue(client.auth.currentSessionOrNull() == refreshed)
             assertTrue(storage.loadSessionOrNull() == refreshed)
             assertTrue(client.auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun initializationStorageReadCannotOverwriteImportedSession() = storageReadDuringImport(initializing = true)
+
+    @Test
+    fun runtimeStorageReadCannotOverwriteImportedSession() = storageReadDuringImport(initializing = false)
+
+    private fun storageReadDuringImport(initializing: Boolean) = runTest(timeout = 30.seconds) {
+        val original = session("B", "stored")
+        val replacement = session("A", "imported")
+        val persisted = MemorySessionManager(original)
+        val readEntered = CompletableDeferred<Unit>()
+        val releaseRead = CompletableDeferred<Unit>()
+        var reads = 0
+        val storage = object : SessionManager by persisted {
+            override suspend fun loadSession(): UserSession {
+                val snapshot = persisted.loadSession()
+                reads++
+                readEntered.complete(Unit)
+                releaseRead.await()
+                return snapshot
+            }
+        }
+        val client = createMockedSupabaseClient(configuration = {
+            defaultLogLevel = LogLevel.NONE
+            coroutineDispatcher = StandardTestDispatcher(testScheduler)
+            install(Auth) {
+                sessionManager = storage
+                autoLoadFromStorage = initializing
+            }
+        }) { error("Unexpected HTTP request during storage authority observation") }
+        try {
+            val auth = client.auth as AuthImpl
+            val loading = if (initializing) null else {
+                runCurrent()
+                auth.awaitInitialization()
+                async { auth.loadFromStorage() }
+            }
+            runCurrent()
+            assertTrue(readEntered.isCompleted)
+            readEntered.await()
+            assertTrue(reads == 1)
+            auth.importSession(replacement, source = SessionSource.External)
+            runCurrent()
+            val status = assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value)
+            assertTrue(status.session == replacement)
+            assertTrue(status.source == SessionSource.External)
+            assertTrue(persisted.loadSessionOrNull() == replacement)
+            val refreshJob = auth.sessionJob
+            assertTrue(refreshJob?.isActive == true)
+            val refreshInformation = auth.autoRefreshInformation()
+            val observationTime = testScheduler.currentTime
+
+            releaseRead.complete(Unit)
+            runCurrent()
+            if (loading != null) {
+                assertTrue(loading.isCompleted)
+                // The Boolean reports finding data, even when its import is rejected.
+                assertTrue(loading.await())
+            }
+            assertTrue(testScheduler.currentTime == observationTime)
+            assertTrue(reads == 1)
+            assertTrue(auth.currentSessionOrNull() == replacement)
+            assertTrue(persisted.loadSessionOrNull() == replacement)
+            assertTrue(auth.sessionStatus.value === status)
+            assertTrue(assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value).source == SessionSource.External)
+            assertTrue(auth.sessionJob === refreshJob)
+            assertTrue(auth.isAutoRefreshRunning)
+            assertTrue(auth.autoRefreshInformation() == refreshInformation)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun delayedStorageInitializationCannotReplaceEstablishedSession() = runTest(timeout = 30.seconds) {
+        val replacement = session("A", "imported")
+        val persisted = MemorySessionManager(session("B", "stored"))
+        var reads = 0
+        val storage = object : SessionManager by persisted {
+            override suspend fun loadSession(): UserSession {
+                reads++
+                return persisted.loadSession()
+            }
+        }
+        val client = createMockedSupabaseClient(configuration = {
+            defaultLogLevel = LogLevel.NONE
+            coroutineDispatcher = StandardTestDispatcher(testScheduler)
+            install(Auth) { sessionManager = storage }
+        }) { error("Unexpected HTTP request during delayed initialization") }
+        try {
+            val auth = client.auth as AuthImpl
+            // Import before the queued initialization coroutine gets its first turn.
+            auth.importSession(replacement, source = SessionSource.External)
+            val status = assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value)
+            val refreshJob = auth.sessionJob
+            assertTrue(refreshJob?.isActive == true)
+            runCurrent()
+            assertTrue(reads == 0)
+            assertTrue(auth.currentSessionOrNull() == replacement)
+            assertTrue(persisted.loadSessionOrNull() == replacement)
+            assertTrue(auth.sessionStatus.value === status)
+            assertTrue(status.source == SessionSource.External)
+            assertTrue(auth.sessionJob === refreshJob)
+            assertTrue(auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun normalStorageLoadPreservesSessionAndSource() = runTest(timeout = 30.seconds) {
+        val original = session("B", "stored")
+        val storage = MemorySessionManager(original)
+        val client = createMockedSupabaseClient(configuration = {
+            defaultLogLevel = LogLevel.NONE
+            coroutineDispatcher = StandardTestDispatcher(testScheduler)
+            install(Auth) {
+                sessionManager = storage
+                autoLoadFromStorage = false
+            }
+        }) { error("Unexpected HTTP request during normal storage load") }
+        try {
+            runCurrent()
+            client.auth.awaitInitialization()
+            assertTrue(client.auth.loadFromStorage())
+            runCurrent()
+            val status = assertIs<SessionStatus.Authenticated>(client.auth.sessionStatus.value)
+            assertTrue(status.session == original)
+            assertTrue(status.source == SessionSource.Storage)
+            assertTrue(client.auth.currentSessionOrNull() == original)
+            assertTrue(storage.loadSessionOrNull() == original)
+            assertTrue(client.auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun missingStorageSessionReturnsFalseWithoutChangingState() = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        val client = createMockedSupabaseClient(configuration = {
+            defaultLogLevel = LogLevel.NONE
+            coroutineDispatcher = StandardTestDispatcher(testScheduler)
+            install(Auth) {
+                sessionManager = storage
+                autoLoadFromStorage = false
+            }
+        }) { error("Unexpected HTTP request during empty storage load") }
+        try {
+            runCurrent()
+            client.auth.awaitInitialization()
+            val status = assertIs<SessionStatus.NotAuthenticated>(client.auth.sessionStatus.value)
+            assertFalse(client.auth.loadFromStorage())
+            assertTrue(client.auth.sessionStatus.value === status)
+            assertNull(client.auth.currentSessionOrNull())
+            assertNull(storage.loadSessionOrNull())
+            assertFalse(client.auth.isAutoRefreshRunning)
         } finally {
             client.close()
         }
