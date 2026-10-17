@@ -917,8 +917,9 @@ class Sdk002IdentityRaceTest {
                     assertTrue(request.headers["Authorization"] == "Bearer ${a.accessToken}")
                     logouts++
                     logoutEntered.complete(Unit)
-                    respondJson("{}")
+                    val response = respondJson("{}")
                     logoutResponseReturned.complete(Unit)
+                    response
                 }
                 else -> error("Unexpected request in user-update boundary test")
             }
