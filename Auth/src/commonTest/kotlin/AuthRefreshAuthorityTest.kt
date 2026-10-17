@@ -11,6 +11,7 @@ import io.github.jan.supabase.auth.user.UserSession
 import io.github.jan.supabase.logging.LogLevel
 import io.github.jan.supabase.testing.createMockedSupabaseClient
 import io.github.jan.supabase.testing.respondJson
+import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respondError
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CompletableDeferred
@@ -48,32 +49,59 @@ class AuthRefreshAuthorityTest {
     fun laterManualRefreshSurvivesEarlierSessionMissingError() = concurrentRefreshes(missing = true)
 
     private fun concurrentRefreshes(missing: Boolean = false) = runTest(timeout = 30.seconds) {
-        val storage = MemorySessionManager(session("B", "1"))
+        val original = session("B", "1")
+        val storage = MemorySessionManager(original)
         val latest = session("B", "latest")
         val entered = CompletableDeferred<Unit>()
+        val laterEntered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
+        val testDispatcher = StandardTestDispatcher(testScheduler)
         var requests = 0
         val client = createMockedSupabaseClient(configuration = {
             defaultLogLevel = LogLevel.NONE
-            coroutineDispatcher = StandardTestDispatcher(testScheduler)
+            coroutineDispatcher = testDispatcher
+            httpEngine = MockEngine.create {
+                dispatcher = testDispatcher
+                addHandler {
+                    when (++requests) {
+                        1 -> {
+                            entered.complete(Unit)
+                            release.await()
+                            if (missing) respondError(HttpStatusCode.BadRequest, """{"error_code":"session_not_found"}""")
+                            else respondJson(session("B", "earlier"))
+                        }
+                        2 -> {
+                            laterEntered.complete(Unit)
+                            respondJson(latest)
+                        }
+                        else -> error("Unexpected additional refresh during the authority observation window")
+                    }
+                }
+            }
             install(Auth) { sessionManager = storage }
-        }) {
-            if (++requests == 1) {
-                entered.complete(Unit)
-                release.await()
-                if (missing) respondError(HttpStatusCode.BadRequest, """{"error_code":"session_not_found"}""")
-                else respondJson(session("B", "earlier"))
-            } else respondJson(latest)
-        }
+        })
         try {
             client.auth.awaitInitialization()
             val earlier = async { runCatching { client.auth.refreshCurrentSession() } }
-            entered.await()
-            client.auth.refreshCurrentSession()
-            val status = client.auth.sessionStatus.value
-            release.complete(Unit)
-            val result = earlier.await()
             runCurrent()
+            assertTrue(entered.isCompleted)
+            entered.await()
+            val later = async { client.auth.refreshCurrentSession() }
+            runCurrent()
+            assertTrue(laterEntered.isCompleted)
+            assertTrue(later.isCompleted)
+            later.await()
+            val status = assertIs<SessionStatus.Authenticated>(client.auth.sessionStatus.value)
+            assertTrue(assertIs<SessionSource.Refresh>(status.source).oldSession == original)
+            val observationTime = testScheduler.currentTime
+            release.complete(Unit)
+            // Only drain the current instant. All HTTP work shares this scheduler,
+            // so awaiting completion must not skip to a future auto-refresh deadline.
+            runCurrent()
+            assertTrue(earlier.isCompleted)
+            val result = earlier.await()
+            assertTrue(testScheduler.currentTime == observationTime)
+            assertTrue(requests == 2)
             if (missing) assertIs<AuthSessionMissingException>(result.exceptionOrNull())
             else assertTrue(result.isSuccess)
             assertTrue(client.auth.sessionStatus.value === status)
@@ -194,32 +222,61 @@ class AuthRefreshAuthorityTest {
         val latest = session("B", "automatic")
         val storage = MemorySessionManager(original)
         val entered = CompletableDeferred<Unit>()
+        val automaticEntered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
+        val releaseAutomatic = CompletableDeferred<Unit>()
+        val testDispatcher = StandardTestDispatcher(testScheduler)
         var requests = 0
         val client = createMockedSupabaseClient(configuration = {
             defaultLogLevel = LogLevel.NONE
-            coroutineDispatcher = StandardTestDispatcher(testScheduler)
-            install(Auth) { sessionManager = storage }
-        }) {
-            requests++
-            if (requests == 1) {
-                entered.complete(Unit)
-                release.await()
-                respondJson(session("B", "manual-old"))
-            } else {
-                respondJson(latest)
+            coroutineDispatcher = testDispatcher
+            httpEngine = MockEngine.create {
+                dispatcher = testDispatcher
+                addHandler {
+                    when (++requests) {
+                        1 -> {
+                            entered.complete(Unit)
+                            release.await()
+                            respondJson(session("B", "manual-old"))
+                        }
+                        2 -> {
+                            automaticEntered.complete(Unit)
+                            releaseAutomatic.await()
+                            respondJson(latest)
+                        }
+                        else -> error("Unexpected additional refresh during the authority observation window")
+                    }
+                }
             }
-        }
+            install(Auth) { sessionManager = storage }
+        })
         try {
             client.auth.awaitInitialization()
             val manual = launch { client.auth.refreshCurrentSession() }
+            runCurrent()
+            assertTrue(entered.isCompleted)
             entered.await()
             advanceTimeBy(2_881_000) // Beyond the original session's 80% refresh deadline.
             runCurrent()
+            assertTrue(automaticEntered.isCompleted)
+            automaticEntered.await()
             assertTrue(requests == 2)
+            assertTrue(client.auth.currentSessionOrNull() == original)
+            releaseAutomatic.complete(Unit)
+            runCurrent()
             assertTrue(client.auth.currentSessionOrNull() == latest)
+            val status = assertIs<SessionStatus.Authenticated>(client.auth.sessionStatus.value)
+            assertTrue(assertIs<SessionSource.Refresh>(status.source).oldSession == original)
+            val observationTime = testScheduler.currentTime
             release.complete(Unit)
+            // Do not advance virtual time again: session expiry uses the real clock,
+            // while the replacement auto-refresh delay starts at this virtual instant.
+            runCurrent()
+            assertTrue(manual.isCompleted)
             manual.join()
+            assertTrue(testScheduler.currentTime == observationTime)
+            assertTrue(requests == 2)
+            assertTrue(client.auth.sessionStatus.value === status)
             assertTrue(client.auth.currentSessionOrNull() == latest)
             assertTrue(storage.loadSessionOrNull() == latest)
             assertTrue(client.auth.isAutoRefreshRunning)
