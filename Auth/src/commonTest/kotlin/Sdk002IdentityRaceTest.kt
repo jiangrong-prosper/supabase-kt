@@ -2,6 +2,8 @@ import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.auth.AuthImpl
 import io.github.jan.supabase.auth.MemorySessionManager
+import io.github.jan.supabase.auth.SessionManager
+import io.github.jan.supabase.auth.SessionImportResult
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.exception.SessionRequiredException
 import io.github.jan.supabase.auth.parseFragmentAndImportSession
@@ -21,9 +23,16 @@ import io.ktor.client.engine.mock.respondError
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.jsonObject
@@ -134,7 +143,14 @@ class Sdk002IdentityRaceTest {
     private fun recoveryCallback(existingAccount: Boolean) = runTest(timeout = 30.seconds) {
         val a = session("A").copy(type = "recovery")
         val b = session("B")
-        val storage = MemorySessionManager()
+        val delegate = MemorySessionManager()
+        var saved: UserSession? = null
+        val storage = object : SessionManager by delegate {
+            override suspend fun saveSession(session: UserSession) {
+                delegate.saveSession(session)
+                saved = session
+            }
+        }
         val lookupEntered = CompletableDeferred<String?>()
         val releaseLookup = CompletableDeferred<Unit>()
         val callback = CompletableDeferred<CallbackObservation>()
@@ -157,7 +173,7 @@ class Sdk002IdentityRaceTest {
             client.auth.parseFragmentAndImportSession(fragment) { delivered ->
                 callbacks++
                 callback.complete(
-                    CallbackObservation(delivered, client.auth.currentSessionOrNull(), client.auth.currentAccessTokenOrNull(), client.auth.sessionStatus.value)
+                    CallbackObservation(delivered, client.auth.currentSessionOrNull(), client.auth.currentAccessTokenOrNull(), client.auth.sessionStatus.value, saved)
                 )
             }
             runCurrent()
@@ -194,14 +210,569 @@ class Sdk002IdentityRaceTest {
             assertTrue(persisted == delivered)
             assertTrue(status.source == SessionSource.External)
             assertFalse(client.auth.isAutoRefreshRunning)
-            if (existingAccount) {
-                val callbackStatus = observed.status as? SessionStatus.Authenticated
-                assertTrue(
-                    observed.current == delivered && observed.accessToken == a.accessToken && callbackStatus?.session == delivered,
-                    "Recovery success callback ran before import: deliveredUser=${delivered.user?.id}, " +
-                        "callbackCurrentUser=${observed.current?.user?.id}, callbackAccessOwner=${owner(observed.accessToken)}"
-                )
+            val callbackStatus = observed.status as? SessionStatus.Authenticated
+            assertTrue(
+                observed.current == delivered && observed.accessToken == a.accessToken && callbackStatus?.session == delivered,
+                "Recovery success callback ran before import: deliveredUser=${delivered.user?.id}, " +
+                    "callbackCurrentUser=${observed.current?.user?.id}, callbackAccessOwner=${owner(observed.accessToken)}"
+            )
+            assertTrue(observed.saved == delivered)
+            assertTrue(callbackStatus?.source == SessionSource.External)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun recoveryImmediateRefreshCommitsBeforeCallback() = pendingRecovery(RecoveryBoundary.SUCCESS)
+
+    @Test
+    fun recoveryRefreshInvalidatedByNewAccount() = pendingRecovery(RecoveryBoundary.IMPORT)
+
+    @Test
+    fun recoveryRefreshInvalidatedBySignOut() = pendingRecovery(RecoveryBoundary.SIGN_OUT)
+
+    @Test
+    fun recoverySameAccountNewGenerationInvalidatesImport() = pendingRecovery(RecoveryBoundary.RELOGIN)
+
+    @Test
+    fun recoveryAuthenticationFailureCannotReportSuccess() = pendingRecovery(RecoveryBoundary.AUTH_FAILURE)
+
+    @Test
+    fun recoveryServerFailureRetriesAndCallsBackOnce() = pendingRecovery(RecoveryBoundary.RETRY)
+
+    @Test
+    fun recoveryNetworkFailureRetriesAndCallsBackOnce() = pendingRecovery(RecoveryBoundary.NETWORK_RETRY)
+
+    @Test
+    fun recoveryCancelledRefreshTerminatesWithoutSuccess() = pendingRecovery(RecoveryBoundary.CANCEL)
+
+    @Test
+    fun recoveryCommittedReceiptSurvivesJobReplacement() = pendingRecovery(RecoveryBoundary.JOB_REPLACEMENT)
+
+    @Test
+    fun recoveryCommittedReceiptSurvivesLaterRefresh() = pendingRecovery(RecoveryBoundary.LATER_REFRESH)
+
+    @Test
+    fun recoveryRepeatedPendingRefreshOnlyConfirmsFinalCommit() = pendingRecovery(RecoveryBoundary.PENDING_AGAIN)
+
+    @Test
+    fun recoveryRetryInvalidationTerminatesWithoutAnotherRequest() = pendingRecovery(RecoveryBoundary.RETRY_INVALIDATION)
+
+    private enum class RecoveryBoundary {
+        SUCCESS, IMPORT, SIGN_OUT, RELOGIN, AUTH_FAILURE, RETRY, NETWORK_RETRY,
+        CANCEL, JOB_REPLACEMENT, LATER_REFRESH, PENDING_AGAIN, RETRY_INVALIDATION
+    }
+
+    private fun pendingRecovery(boundary: RecoveryBoundary) = runTest(timeout = 30.seconds) {
+        // Exercise the public callback path and independently verify the internal terminal
+        // receipt, including cancellation/invalidations that have no public success callback.
+        for (recoveryCallback in listOf(true, false)) pendingRecovery(boundary, recoveryCallback)
+    }
+
+    private suspend fun TestScope.pendingRecovery(boundary: RecoveryBoundary, recoveryCallback: Boolean) {
+        val original = session("A").copy(type = "recovery", expiresIn = 0, expiresAt = Instant.fromEpochMilliseconds(0))
+        val before = session("B")
+        val replacement = session(if (boundary == RecoveryBoundary.RELOGIN) "A" else "B").copy(
+            accessToken = "sdk002-replacement-access", refreshToken = "sdk002-replacement-refresh"
+        )
+        val refreshed = session("A").copy(accessToken = "sdk002-refreshed-access", refreshToken = "sdk002-refreshed-refresh")
+        val pendingAgain = original.copy(accessToken = "sdk002-pending-access", refreshToken = "sdk002-pending-refresh")
+        val later = refreshed.copy(accessToken = "sdk002-later-access", refreshToken = "sdk002-later-refresh")
+        val entered = List(2) { CompletableDeferred<Unit>() }
+        val release = List(2) { CompletableDeferred<Unit>() }
+        val saveEntered = CompletableDeferred<Unit>()
+        val releaseSave = CompletableDeferred<Unit>()
+        val delegate = MemorySessionManager()
+        var saved: UserSession? = null
+        var saves = 0
+        val storage = object : SessionManager by delegate {
+            override suspend fun saveSession(session: UserSession) {
+                if (session.accessToken == refreshed.accessToken) {
+                    saveEntered.complete(Unit)
+                    releaseSave.await()
+                }
+                delegate.saveSession(session)
+                saved = session
+                saves++
             }
+        }
+        var requests = 0
+        var lookups = 0
+        var logouts = 0
+        var callbacks = 0
+        val callback = CompletableDeferred<CallbackObservation>()
+        val client = controlledClient(storage, autoRefresh = true) { request ->
+            when (request.url.pathAfterVersion()) {
+                "/user" -> {
+                    assertEquals(HttpMethod.Get, request.method)
+                    assertTrue(request.headers["Authorization"] == "Bearer ${original.accessToken}")
+                    lookups++
+                    respondJson(requireNotNull(original.user))
+                }
+                "/logout" -> {
+                    logouts++
+                    respondJson(Unit)
+                }
+                "/token" -> {
+                    assertEquals(HttpMethod.Post, request.method)
+                    assertEquals("refresh_token", request.url.parameters["grant_type"])
+                    val index = requests++
+                    check(index < 2) { "Unexpected additional recovery refresh" }
+                    val expectedToken = when {
+                        index == 0 -> original.refreshToken
+                        boundary == RecoveryBoundary.PENDING_AGAIN -> pendingAgain.refreshToken
+                        boundary == RecoveryBoundary.LATER_REFRESH -> refreshed.refreshToken
+                        else -> original.refreshToken
+                    }
+                    assertTrue(request.body.toJsonElement().jsonObject["refresh_token"]?.jsonPrimitive?.content == expectedToken)
+                    entered[index].complete(Unit)
+                    release[index].await()
+                    when {
+                        boundary == RecoveryBoundary.AUTH_FAILURE -> respondError(HttpStatusCode.BadRequest, """{"error_code":"session_not_found"}""")
+                        boundary in listOf(RecoveryBoundary.RETRY, RecoveryBoundary.RETRY_INVALIDATION) && index == 0 -> respondError(HttpStatusCode.ServiceUnavailable, "{}")
+                        boundary == RecoveryBoundary.NETWORK_RETRY && index == 0 -> throw IllegalStateException("Synthetic transport failure")
+                        boundary == RecoveryBoundary.PENDING_AGAIN && index == 0 -> respondJson(pendingAgain)
+                        boundary == RecoveryBoundary.LATER_REFRESH && index == 1 -> respondJson(later)
+                        else -> respondJson(refreshed)
+                    }
+                }
+                else -> error("Unexpected recovery endpoint")
+            }
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            auth.importSession(before, autoRefresh = false, source = SessionSource.External)
+            val receipt = if (recoveryCallback) {
+                auth.parseFragmentAndImportSession(recoveryFragment(original)) { delivered ->
+                    callbacks++
+                    callback.complete(CallbackObservation(delivered, auth.currentSessionOrNull(), auth.currentAccessTokenOrNull(), auth.sessionStatus.value, saved))
+                }
+                null
+            } else async { auth.importSessionWithAcknowledgement(original) }
+            runCurrent()
+            assertTrue(entered[0].isCompleted)
+            assertTrue(lookups == if (recoveryCallback) 1 else 0)
+            assertTrue(requests == 1 && callbacks == 0)
+            assertFalse(callback.isCompleted)
+            assertTrue(receipt?.isCompleted != true)
+            assertTrue(auth.currentSessionOrNull() == before && saved == before)
+            val initialJob = requireNotNull(auth.sessionJob)
+
+            when (boundary) {
+                RecoveryBoundary.IMPORT, RecoveryBoundary.RELOGIN -> auth.importSession(replacement, autoRefresh = false, source = SessionSource.External)
+                RecoveryBoundary.SIGN_OUT -> auth.signOut()
+                RecoveryBoundary.CANCEL -> auth.stopAutoRefreshForCurrentSession()
+                else -> Unit
+            }
+            release[0].complete(Unit)
+            runCurrent()
+            val retries = boundary in listOf(RecoveryBoundary.RETRY, RecoveryBoundary.NETWORK_RETRY, RecoveryBoundary.RETRY_INVALIDATION)
+            if (retries) {
+                assertFalse(callback.isCompleted)
+                assertTrue(receipt?.isCompleted != true)
+                assertTrue(saves == 1 && requests == 1)
+                if (boundary == RecoveryBoundary.RETRY_INVALIDATION) auth.importSession(replacement, autoRefresh = false, source = SessionSource.External)
+                advanceTimeBy(auth.config.retryDelay.inWholeMilliseconds)
+                runCurrent()
+            }
+            if (boundary in listOf(RecoveryBoundary.RETRY, RecoveryBoundary.NETWORK_RETRY, RecoveryBoundary.PENDING_AGAIN)) {
+                assertTrue(entered[1].isCompleted)
+                assertTrue(initialJob.isCancelled)
+                assertFalse(callback.isCompleted)
+                assertTrue(receipt?.isCompleted != true)
+                assertTrue(saves == 1)
+                release[1].complete(Unit)
+                runCurrent()
+            }
+            val invalidated = boundary in listOf(RecoveryBoundary.IMPORT, RecoveryBoundary.RELOGIN, RecoveryBoundary.SIGN_OUT, RecoveryBoundary.RETRY_INVALIDATION)
+            val failed = boundary in listOf(RecoveryBoundary.AUTH_FAILURE, RecoveryBoundary.CANCEL)
+            if (invalidated || failed) {
+                assertFalse(saveEntered.isCompleted)
+                assertTrue(callbacks == 0 && !callback.isCompleted)
+                if (receipt != null) {
+                    assertTrue(receipt.isCompleted, "Terminal import must not leave its acknowledgement suspended")
+                    if (invalidated) assertIs<SessionImportResult.Invalidated>(receipt.await())
+                    else assertIs<SessionImportResult.NotCommitted>(receipt.await())
+                }
+                val cleared = boundary in listOf(RecoveryBoundary.SIGN_OUT, RecoveryBoundary.AUTH_FAILURE)
+                val expected = if (cleared) null else if (boundary == RecoveryBoundary.CANCEL) before else replacement
+                assertTrue(auth.currentSessionOrNull() == expected)
+                assertTrue(storage.loadSessionOrNull() == expected)
+                if (cleared) assertIs<SessionStatus.NotAuthenticated>(auth.sessionStatus.value)
+                else assertTrue(assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value).source == SessionSource.External)
+                assertFalse(auth.isAutoRefreshRunning)
+                assertTrue(requests == 1)
+                assertTrue(logouts == if (boundary == RecoveryBoundary.SIGN_OUT) 1 else 0)
+                return
+            }
+
+            // The response alone is insufficient: save is suspended and publication has
+            // not happened. A callback/receipt at this point would be a false positive.
+            assertTrue(saveEntered.isCompleted)
+            assertTrue(auth.currentSessionOrNull() == before && saved == before)
+            assertFalse(callback.isCompleted)
+            assertTrue(receipt?.isCompleted != true)
+            val observationTime = testScheduler.currentTime
+            releaseSave.complete(Unit)
+            runCurrent()
+            val status = assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value)
+            assertTrue(status.session == refreshed && saved == refreshed)
+            assertTrue(storage.loadSessionOrNull() == refreshed)
+            val source = assertIs<SessionSource.Refresh>(status.source)
+            assertTrue(source.oldSession.accessToken == if (boundary == RecoveryBoundary.PENDING_AGAIN) pendingAgain.accessToken else original.accessToken)
+            assertTrue(initialJob.isCancelled)
+            assertTrue(auth.isAutoRefreshRunning)
+            assertTrue(auth.sessionJob !== initialJob)
+            val committed = if (receipt != null) {
+                assertTrue(receipt.isCompleted)
+                assertIs<SessionImportResult.Committed>(receipt.await()).also {
+                    assertTrue(it.refreshed && it.session == refreshed && it.source == status.source)
+                }
+            } else {
+                assertTrue(callback.isCompleted && callbacks == 1)
+                val observed = callback.await()
+                assertTrue(observed.delivered == refreshed && observed.current == refreshed && observed.saved == refreshed)
+                assertTrue(observed.accessToken == refreshed.accessToken && observed.status == status)
+                null
+            }
+            if (boundary == RecoveryBoundary.JOB_REPLACEMENT) {
+                val job = auth.sessionJob
+                auth.startAutoRefreshForCurrentSession()
+                runCurrent()
+                assertTrue(auth.sessionJob !== job && job?.isCancelled == true && auth.isAutoRefreshRunning)
+            }
+            if (boundary == RecoveryBoundary.LATER_REFRESH) {
+                val refreshing = async { auth.refreshCurrentSession() }
+                runCurrent()
+                assertTrue(entered[1].isCompleted)
+                release[1].complete(Unit)
+                runCurrent()
+                assertTrue(refreshing.isCompleted)
+                refreshing.await()
+                assertTrue(auth.currentSessionOrNull() == later && storage.loadSessionOrNull() == later)
+                assertIs<SessionSource.Refresh>(assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value).source)
+            }
+            runCurrent()
+            assertTrue(testScheduler.currentTime == observationTime)
+            assertTrue(saves == if (boundary == RecoveryBoundary.LATER_REFRESH) 3 else 2)
+            assertTrue(requests == if (boundary in listOf(RecoveryBoundary.RETRY, RecoveryBoundary.NETWORK_RETRY, RecoveryBoundary.PENDING_AGAIN, RecoveryBoundary.LATER_REFRESH)) 2 else 1)
+            if (receipt != null) assertTrue(receipt.await() === committed)
+            else assertTrue(callbacks == 1 && callback.await().delivered == refreshed)
+        } finally {
+            client.close()
+        }
+    }
+
+    private fun recoveryFragment(session: UserSession) = "access_token=${session.accessToken}&refresh_token=${session.refreshToken}" +
+        "&expires_in=${session.expiresIn}&token_type=${session.tokenType}&type=recovery"
+
+    @Test
+    fun recoveryInvalidFragmentKeepsNullCallback() = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        var callbacks = 0
+        val client = controlledClient(storage) { error("Invalid fragment must not perform HTTP") }
+        try {
+            runCurrent()
+            client.auth.awaitInitialization()
+            val before = client.auth.sessionStatus.value
+            client.auth.parseFragmentAndImportSession("invalid") {
+                callbacks++
+                assertNull(it)
+            }
+            runCurrent()
+            assertTrue(callbacks == 1 && client.auth.sessionStatus.value === before)
+            assertNull(storage.loadSessionOrNull())
+            assertFalse(client.auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun recoveryUserQueryFailureCannotImport() = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        var requests = 0
+        var callbacks = 0
+        val client = controlledClient(storage) {
+            assertEquals("/user", it.url.pathAfterVersion())
+            requests++
+            respondError(HttpStatusCode.Unauthorized, "{}")
+        }
+        try {
+            runCurrent()
+            client.auth.awaitInitialization()
+            val before = session("B")
+            client.auth.importSession(before, source = SessionSource.External)
+            val status = client.auth.sessionStatus.value
+            client.auth.parseFragmentAndImportSession(recoveryFragment(session("A"))) { callbacks++ }
+            runCurrent()
+            assertTrue(requests == 1 && callbacks == 0)
+            assertTrue(client.auth.currentSessionOrNull() == before && storage.loadSessionOrNull() == before)
+            assertTrue(client.auth.sessionStatus.value === status)
+            assertFalse(client.auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun recoverySaveFailureCannotReportSuccess() = recoveryException(saveFailure = true)
+
+    @Test
+    fun recoveryCallbackExceptionDoesNotRepeatImportOrCallback() = recoveryException(saveFailure = false)
+
+    private fun recoveryException(saveFailure: Boolean) = runTest(timeout = 30.seconds) {
+        val expected = IllegalStateException("Synthetic recovery failure")
+        val errors = mutableListOf<Throwable>()
+        val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, error -> errors.add(error) })
+        val delegate = MemorySessionManager()
+        var saves = 0
+        var saved: UserSession? = null
+        val storage = object : SessionManager by delegate {
+            override suspend fun saveSession(session: UserSession) {
+                saves++
+                if (saveFailure && session.user?.id == "A") throw expected
+                delegate.saveSession(session)
+                saved = session
+            }
+        }
+        var requests = 0
+        var callbacks = 0
+        var delivered: UserSession? = null
+        val client = controlledClient(storage, scope = scope) {
+            assertEquals("/user", it.url.pathAfterVersion())
+            requests++
+            respondJson(requireNotNull(session("A").user))
+        }
+        try {
+            runCurrent()
+            client.auth.awaitInitialization()
+            val before = session("B")
+            client.auth.importSession(before, source = SessionSource.External)
+            val status = client.auth.sessionStatus.value
+            client.auth.parseFragmentAndImportSession(recoveryFragment(session("A"))) {
+                callbacks++
+                delivered = it
+                assertTrue(client.auth.currentSessionOrNull() == it && saved == it)
+                throw expected
+            }
+            runCurrent()
+            assertTrue(errors.size == 1 && errors.single() === expected)
+            assertTrue(requests == 1 && saves == 2)
+            if (saveFailure) {
+                assertTrue(callbacks == 0 && delivered == null)
+                assertTrue(client.auth.currentSessionOrNull() == before && delegate.loadSessionOrNull() == before)
+                assertTrue(client.auth.sessionStatus.value === status)
+            } else {
+                assertTrue(callbacks == 1 && delivered?.user?.id == "A")
+                assertTrue(client.auth.currentSessionOrNull() == delivered && delegate.loadSessionOrNull() == delivered)
+                assertTrue(assertIs<SessionStatus.Authenticated>(client.auth.sessionStatus.value).source == SessionSource.External)
+            }
+            runCurrent()
+            assertTrue(errors.size == 1 && requests == 1 && saves == 2)
+            assertTrue(callbacks == if (saveFailure) 0 else 1)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun recoveryDirectReceiptsBelongToDistinctOperations() = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        val client = controlledClient(storage) { error("Direct import must not perform HTTP") }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            val original = session("A")
+            val first = assertIs<SessionImportResult.Committed>(auth.importSessionWithAcknowledgement(original))
+            val second = assertIs<SessionImportResult.Committed>(auth.importSessionWithAcknowledgement(original))
+            assertTrue(!first.refreshed && !second.refreshed)
+            assertTrue(first.operationId !== second.operationId)
+            assertTrue(first.session == original && second.session == original)
+            assertTrue(first.source == SessionSource.External && second.source == SessionSource.External)
+            assertTrue(auth.currentSessionOrNull() == original && storage.loadSessionOrNull() == original)
+            assertFalse(auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun recoveryRefreshedSaveFailureIsNotExternalInvalidation() = recoverySaveBoundary(cancel = false)
+
+    @Test
+    fun recoveryCancellationDuringSaveCannotConfirmCommit() = recoverySaveBoundary(cancel = true)
+
+    private fun recoverySaveBoundary(cancel: Boolean) = runTest(timeout = 30.seconds) {
+        val before = session("B")
+        val original = session("A").copy(expiresIn = 0, expiresAt = Instant.fromEpochMilliseconds(0))
+        val refreshed = session("A")
+        val delegate = MemorySessionManager()
+        val saveEntered = CompletableDeferred<Unit>()
+        val releaseSave = CompletableDeferred<Unit>()
+        var saves = 0
+        val storage = object : SessionManager by delegate {
+            override suspend fun saveSession(session: UserSession) {
+                saves++
+                if (session.user?.id == "A") {
+                    saveEntered.complete(Unit)
+                    if (cancel) releaseSave.await()
+                    else throw IllegalStateException("Synthetic refreshed save failure")
+                }
+                delegate.saveSession(session)
+            }
+        }
+        var requests = 0
+        val client = controlledClient(storage, autoRefresh = true) {
+            requests++
+            respondJson(refreshed)
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            auth.importSession(before, autoRefresh = false, source = SessionSource.External)
+            val status = auth.sessionStatus.value
+            val waiting = async { auth.importSessionWithAcknowledgement(original) }
+            runCurrent()
+            assertTrue(saveEntered.isCompleted)
+            if (cancel) {
+                assertFalse(waiting.isCompleted)
+                auth.stopAutoRefreshForCurrentSession()
+                runCurrent()
+            }
+            assertTrue(waiting.isCompleted, "Save failure/cancellation must terminate the receipt")
+            assertIs<SessionImportResult.NotCommitted>(waiting.await())
+            if (!cancel) {
+                // Preserve the existing retry policy; its old generation is no longer
+                // current after the failed import, so it must not retry a stale save.
+                advanceTimeBy(auth.config.retryDelay.inWholeMilliseconds)
+                runCurrent()
+            }
+            releaseSave.complete(Unit)
+            runCurrent()
+            assertTrue(requests == 1 && saves == 2)
+            assertTrue(auth.currentSessionOrNull() == before && delegate.loadSessionOrNull() == before)
+            assertTrue(auth.sessionStatus.value === status)
+            assertFalse(auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun recoveryWaiterCancellationDoesNotCancelLegalImport() = runTest(timeout = 30.seconds) {
+        val original = session("A").copy(expiresIn = 0, expiresAt = Instant.fromEpochMilliseconds(0))
+        val refreshed = session("A")
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val storage = MemorySessionManager()
+        var requests = 0
+        val client = controlledClient(storage, autoRefresh = true) {
+            requests++
+            entered.complete(Unit)
+            release.await()
+            respondJson(refreshed)
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            val waiting = async { auth.importSessionWithAcknowledgement(original) }
+            runCurrent()
+            assertTrue(entered.isCompleted)
+            val job = requireNotNull(auth.sessionJob)
+            waiting.cancel()
+            runCurrent()
+            assertTrue(waiting.isCancelled && job.isActive)
+            release.complete(Unit)
+            runCurrent()
+            assertTrue(requests == 1)
+            assertTrue(auth.currentSessionOrNull() == refreshed && storage.loadSessionOrNull() == refreshed)
+            assertIs<SessionSource.Refresh>(assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value).source)
+            assertTrue(auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun recoveryRetryFallbackConfirmsOriginalWithoutExtraSave() = runTest(timeout = 30.seconds) {
+        val original = session("A").copy(expiresIn = 0, expiresAt = Instant.fromEpochMilliseconds(0))
+        val before = session("B")
+        val storage = MemorySessionManager()
+        var requests = 0
+        val client = controlledClient(storage) {
+            requests++
+            respondError(HttpStatusCode.ServiceUnavailable, "{}")
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            auth.importSession(before, source = SessionSource.External)
+            // Explicit autoRefresh=true initially, existing config=false on retry.
+            val waiting = async { auth.importSessionWithAcknowledgement(original, autoRefresh = true) }
+            runCurrent()
+            assertTrue(requests == 1 && !waiting.isCompleted)
+            val job = requireNotNull(auth.sessionJob)
+            advanceTimeBy(auth.config.retryDelay.inWholeMilliseconds)
+            runCurrent()
+            assertTrue(waiting.isCompleted && job.isCancelled)
+            val result = assertIs<SessionImportResult.Committed>(waiting.await())
+            assertTrue(!result.refreshed && result.session == original && result.source == SessionSource.External)
+            assertTrue(auth.currentSessionOrNull() == original)
+            // Existing no-auto-refresh rule does not save expiresIn=0 sessions.
+            assertTrue(storage.loadSessionOrNull() == before)
+            assertFalse(auth.isAutoRefreshRunning)
+            assertTrue(requests == 1)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun recoveryUnconfinedCallbackRunsOutsideCommitMutex() = runTest(timeout = 30.seconds) {
+        val original = session("A").copy(expiresIn = 0)
+        val refreshed = session("A")
+        val replacement = session("B")
+        val storage = MemorySessionManager()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val scope = CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
+        var callbacks = 0
+        var reentrantImportCompleted = false
+        val client = controlledClient(storage, autoRefresh = true, scope = scope) { request ->
+            if (request.url.pathAfterVersion() == "/user") respondJson(requireNotNull(original.user))
+            else {
+                entered.complete(Unit)
+                release.await()
+                respondJson(refreshed)
+            }
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            auth.parseFragmentAndImportSession(recoveryFragment(original)) { delivered ->
+                callbacks++
+                assertTrue(delivered == refreshed && auth.currentSessionOrNull() == refreshed)
+                val importing = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    auth.importSession(replacement, autoRefresh = false, source = SessionSource.External)
+                }
+                reentrantImportCompleted = importing.isCompleted
+            }
+            runCurrent()
+            assertTrue(entered.isCompleted && callbacks == 0)
+            release.complete(Unit)
+            runCurrent()
+            assertTrue(callbacks == 1 && reentrantImportCompleted)
+            assertTrue(auth.currentSessionOrNull() == replacement && storage.loadSessionOrNull() == replacement)
+            assertFalse(auth.isAutoRefreshRunning)
         } finally {
             client.close()
         }
@@ -432,9 +1003,11 @@ class Sdk002IdentityRaceTest {
     }
 
     private fun TestScope.controlledClient(
-        storage: MemorySessionManager,
+        storage: SessionManager,
         requireSession: Boolean = false,
         jwtToken: String? = null,
+        autoRefresh: Boolean = false,
+        scope: CoroutineScope? = null,
         handler: MockRequestHandler
     ): SupabaseClient {
         val testDispatcher = StandardTestDispatcher(testScheduler)
@@ -449,7 +1022,8 @@ class Sdk002IdentityRaceTest {
                 sessionManager = storage
                 autoLoadFromStorage = false
                 autoSaveToStorage = true
-                alwaysAutoRefresh = false
+                alwaysAutoRefresh = autoRefresh
+                scope?.let { authScope = it }
                 requireValidSession = requireSession
                 this.jwtToken = jwtToken
             }
@@ -460,7 +1034,8 @@ class Sdk002IdentityRaceTest {
         val delivered: UserSession?,
         val current: UserSession?,
         val accessToken: String?,
-        val status: SessionStatus
+        val status: SessionStatus,
+        val saved: UserSession?
     )
 
     private fun session(account: String) = UserSession(

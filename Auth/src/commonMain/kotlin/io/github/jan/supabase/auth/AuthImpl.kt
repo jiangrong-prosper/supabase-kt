@@ -63,6 +63,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.encodeURLParameter
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -105,6 +106,45 @@ private object RefreshRequest : AbstractCoroutineContextElement(Key) {
 // Refreshes advance the generation while retaining user-update authority. Other
 // session operations establish new authority, including a same-account sign-in.
 private class SessionGeneration(val userUpdateAuthority: Any = Any())
+
+internal sealed interface SessionImportResult {
+    data class Committed(
+        val session: UserSession,
+        val source: SessionSource,
+        val refreshed: Boolean,
+        val operationId: Any
+    ) : SessionImportResult
+    data object Invalidated : SessionImportResult
+    data class NotCommitted(val cause: Throwable? = null) : SessionImportResult
+}
+
+// This observes an import; generation remains the sole authority for committing it.
+private class SessionImportAcknowledgement {
+    val result = CompletableDeferred<SessionImportResult>()
+    val generation = AtomicReference<Any?>(null)
+    private val operationId = Any()
+    private val owner = AtomicReference<Any?>(null)
+
+    fun newAttempt(): Any = Any().also { owner.store(it) }
+
+    fun complete(result: SessionImportResult) {
+        this.result.complete(result)
+    }
+
+    fun committed(session: UserSession, source: SessionSource, refreshed: Boolean) {
+        complete(SessionImportResult.Committed(session, source, refreshed, operationId))
+    }
+
+    fun notCommitted(currentGeneration: Any) {
+        // A save can fail after this import advanced generation. That is its own
+        // failure, not invalidation by another identity operation.
+        complete(if (generation.load() === currentGeneration) SessionImportResult.NotCommitted() else SessionImportResult.Invalidated)
+    }
+
+    fun attemptFinished(attempt: Any, result: SessionImportResult) {
+        if (owner.compareAndSet(attempt, null)) complete(result)
+    }
+}
 
 private const val SESSION_REFRESH_THRESHOLD = 0.8
 private val JWKS_TTL = 10.minutes
@@ -552,7 +592,11 @@ internal class AuthImpl(
     override suspend fun refreshSession(refreshToken: String): UserSession =
         requestRefreshSession(refreshToken, sessionGeneration.load())
 
-    private suspend fun requestRefreshSession(refreshToken: String, generation: Any): UserSession {
+    private suspend fun requestRefreshSession(
+        refreshToken: String,
+        generation: Any,
+        acknowledgement: SessionImportAcknowledgement? = null
+    ): UserSession {
         logger.d {
             "Refreshing session"
         }
@@ -566,7 +610,10 @@ internal class AuthImpl(
             }
         } catch (e: AuthSessionMissingException) {
             sessionMutex.withLock {
-                if (sessionGeneration.load() === generation) clearSessionLocked()
+                if (sessionGeneration.load() === generation) {
+                    acknowledgement?.complete(SessionImportResult.NotCommitted(e))
+                    clearSessionLocked()
+                } else acknowledgement?.complete(SessionImportResult.Invalidated)
             }
             throw e
         }
@@ -586,6 +633,27 @@ internal class AuthImpl(
         source: SessionSource
     ) = importSession(session, autoRefresh, source, false)
 
+    internal suspend fun importSessionWithAcknowledgement(
+        session: UserSession,
+        autoRefresh: Boolean = config.alwaysAutoRefresh,
+        source: SessionSource = SessionSource.External
+    ): SessionImportResult {
+        val acknowledgement = SessionImportAcknowledgement()
+        try {
+            sessionMutex.withLock {
+                importSessionLocked(session, autoRefresh, source, acknowledgement = acknowledgement)
+            }
+        } catch (e: Throwable) {
+            acknowledgement.complete(SessionImportResult.NotCommitted(e))
+            throw e
+        }
+        // Await a receipt, never a refresher Job, and never while holding sessionMutex.
+        val result = acknowledgement.result.await()
+        // An unconfined waiter may resume inline from complete() inside the commit.
+        // Cross the lock once before returning so external callbacks cannot run there.
+        return sessionMutex.withLock { result }
+    }
+
     suspend fun importSession(
         session: UserSession,
         autoRefresh: Boolean,
@@ -603,9 +671,13 @@ internal class AuthImpl(
         session: UserSession,
         autoRefresh: Boolean,
         source: SessionSource,
-        userUpdateAuthority: Any = Any()
+        userUpdateAuthority: Any = Any(),
+        acknowledgement: SessionImportAcknowledgement? = null,
+        refreshed: Boolean = false
     ): Job? {
+        if (acknowledgement != null) currentCoroutineContext().ensureActive()
         sessionGeneration.store(SessionGeneration(userUpdateAuthority))
+        acknowledgement?.generation?.store(sessionGeneration.load())
         sessionImportPending = false
         logger.d { "Importing session $session from $source, auto refresh is set to $autoRefresh." }
         if (!autoRefresh) {
@@ -613,7 +685,9 @@ internal class AuthImpl(
                 sessionManager.saveSession(session)
                 logger.d { "Session saved to storage (no auto refresh)" }
             }
+            if (acknowledgement != null) currentCoroutineContext().ensureActive()
             setSessionStatus(SessionStatus.Authenticated(session, source), userUpdateAuthority)
+            acknowledgement?.committed(session, source, refreshed)
             stopAutoRefreshForCurrentSession()
             logger.d { "Session imported successfully." }
             return null
@@ -622,13 +696,15 @@ internal class AuthImpl(
         if (thresholdDate <= Clock.System.now()) {
             sessionImportPending = true
             logger.d { "Session is under the threshold date. Refreshing session..." }
-            return recreateSessionJob(session, source, false)
+            return recreateSessionJob(session, source, false, acknowledgement, refreshed)
         } else {
             if (config.autoSaveToStorage) {
                 sessionManager.saveSession(session)
                 logger.d { "Session saved to storage (auto refresh enabled)" }
             }
+            if (acknowledgement != null) currentCoroutineContext().ensureActive()
             setSessionStatus(SessionStatus.Authenticated(session, source), userUpdateAuthority)
+            acknowledgement?.committed(session, source, refreshed)
             logger.d { "Session imported successfully. Starting auto refresh..." }
             val job = recreateSessionJob(session, source, true)
             logger.d { "Auto refresh started." }
@@ -647,30 +723,46 @@ internal class AuthImpl(
     private fun recreateSessionJob(
         session: UserSession,
         source: SessionSource,
-        delay: Boolean
+        delay: Boolean,
+        acknowledgement: SessionImportAcknowledgement? = null,
+        refreshed: Boolean = false
     ): Job {
+        // Transfer ownership before cancelling the old attempt, including self-cancellation.
+        val attempt = acknowledgement?.newAttempt()
         sessionJob?.cancel()
         val generation = sessionGeneration.load()
         val job = authScope.launch {
             if(delay) delayBeforeExpiry(session, generation)
             tryImportingSession(
-                { refreshSessionIfCurrent(session, generation, config.alwaysAutoRefresh) },
+                { refreshSessionIfCurrent(session, generation, config.alwaysAutoRefresh, acknowledgement) },
                 {
                     sessionMutex.withLock {
-                        if (sessionGeneration.load() === generation) importSessionLocked(session, config.alwaysAutoRefresh, source)
+                        if (sessionGeneration.load() === generation) {
+                            importSessionLocked(session, config.alwaysAutoRefresh, source, acknowledgement = acknowledgement, refreshed = refreshed)
+                        } else acknowledgement?.notCommitted(sessionGeneration.load())
                     }
                 },
                 {
                     sessionMutex.withLock {
                         if (sessionGeneration.load() === generation) updateStatusIfExpired(session, it)
+                        else acknowledgement?.notCommitted(sessionGeneration.load())
                     }
                 },
                 {
                     sessionMutex.withLock {
-                        if (sessionGeneration.load() === generation) clearSessionLocked()
+                        if (sessionGeneration.load() === generation) {
+                            acknowledgement?.complete(SessionImportResult.NotCommitted())
+                            clearSessionLocked()
+                        } else acknowledgement?.notCommitted(sessionGeneration.load())
                     }
                 }
             )
+        }
+        if (acknowledgement != null && attempt != null) job.invokeOnCompletion { cause ->
+            val result = if (sessionGeneration.load() !== acknowledgement.generation.load()) {
+                SessionImportResult.Invalidated
+            } else SessionImportResult.NotCommitted(cause)
+            acknowledgement.attemptFinished(attempt, result)
         }
         sessionJob = job
         return job
@@ -743,15 +835,26 @@ internal class AuthImpl(
             )
     }
 
-    private suspend fun refreshSessionIfCurrent(session: UserSession, generation: Any, autoRefresh: Boolean) {
+    private suspend fun refreshSessionIfCurrent(
+        session: UserSession,
+        generation: Any,
+        autoRefresh: Boolean,
+        acknowledgement: SessionImportAcknowledgement? = null
+    ) {
         logger.d {
             "Session expired. Refreshing session..."
         }
-        if (sessionGeneration.load() !== generation) return
-        val newSession = requestRefreshSession(session.refreshToken, generation)
+        if (sessionGeneration.load() !== generation) {
+            acknowledgement?.complete(SessionImportResult.Invalidated)
+            return
+        }
+        val newSession = requestRefreshSession(session.refreshToken, generation, acknowledgement)
         sessionMutex.withLock {
-            if (sessionGeneration.load() !== generation) return
-            importSessionLocked(newSession, autoRefresh, SessionSource.Refresh(session), sessionGeneration.load().userUpdateAuthority)
+            if (sessionGeneration.load() !== generation) {
+                acknowledgement?.complete(SessionImportResult.Invalidated)
+                return
+            }
+            importSessionLocked(newSession, autoRefresh, SessionSource.Refresh(session), sessionGeneration.load().userUpdateAuthority, acknowledgement, refreshed = true)
             updateRefreshInformation(null, Clock.System.now())
         }
     }
