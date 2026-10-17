@@ -32,6 +32,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.time.Clock
+import kotlin.time.Instant
 
 class MfaApiTest {
 
@@ -252,7 +253,8 @@ class MfaApiTest {
             val expectedFactorId = "123"
             val expectedChallengeId = "456"
             val expectedCode = "789"
-            val expectedSession = userSession()
+            // An explicit expiry survives JSON round trips without reading the clock again.
+            val expectedSession = userSession().copy(expiresAt = Instant.parse("2030-01-01T00:00:00Z"))
             client = createMockedSupabaseClient(
                 configuration = configuration
             ) {
