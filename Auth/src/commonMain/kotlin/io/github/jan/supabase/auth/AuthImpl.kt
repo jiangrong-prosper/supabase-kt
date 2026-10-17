@@ -77,6 +77,9 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.io.bytestring.ByteString
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
@@ -87,10 +90,17 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlin.concurrent.atomics.AtomicReference
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
+
+private object RefreshRequest : AbstractCoroutineContextElement(Key) {
+    object Key : CoroutineContext.Key<RefreshRequest>
+}
 
 private const val SESSION_REFRESH_THRESHOLD = 0.8
 private val JWKS_TTL = 10.minutes
@@ -107,6 +117,11 @@ internal class AuthImpl(
 
     override val logger: SupabaseLogger = supabaseClient.createLogger(Auth.LOGGING_TAG, config)
     private val _sessionStatus = MutableStateFlow<SessionStatus>(SessionStatus.Initializing)
+    // Network calls run outside this lock. A refresh may commit only in the
+    // same authority generation, while storage and status changes are serialized.
+    private val sessionMutex = Mutex()
+    private val sessionGeneration = AtomicReference(Any())
+    private var sessionImportPending = false
     override val sessionStatus: StateFlow<SessionStatus> = _sessionStatus.asStateFlow()
     private val _events = MutableSharedFlow<AuthEvent>(replay = 1)
     override val events: SharedFlow<AuthEvent> = _events.asSharedFlow()
@@ -146,14 +161,14 @@ internal class AuthImpl(
                 logger.i {
                     "Loading session from storage..."
                 }
-                val successful = loadFromStorage(initializing = true)
-                if (successful) {
+                val sessionFound = loadFromStorage(initializing = true)
+                if (sessionFound) {
                     logger.i {
-                        "Successfully loaded session from storage!"
+                        "Found session data in storage."
                     }
                 } else {
                     logger.i {
-                        "No session found in storage."
+                        "No session data was read from storage."
                     }
                 }
                 if(config.autoSetupPlatform) {
@@ -239,10 +254,12 @@ internal class AuthImpl(
     override suspend fun unlinkIdentity(identityId: String, updateLocalUser: Boolean) {
         userApi.delete("user/identities/$identityId")
         if (updateLocalUser) {
-            val session = currentSessionOrNull() ?: return
-            val newUser = session.user?.copy(identities = session.user.identities?.filter { it.identityId != identityId })
-            val newSession = session.copy(user = newUser)
-            setSessionStatus(SessionStatus.Authenticated(newSession, SessionSource.UserIdentitiesChanged(session)))
+            sessionMutex.withLock {
+                val session = currentSessionOrNull() ?: return
+                val newUser = session.user?.copy(identities = session.user.identities?.filter { it.identityId != identityId })
+                val newSession = session.copy(user = newUser)
+                updateSessionLocked(SessionStatus.Authenticated(newSession, SessionSource.UserIdentitiesChanged(session)), save = false)
+            }
         }
     }
 
@@ -290,13 +307,12 @@ internal class AuthImpl(
             redirectUrl?.let { url.parameters.append("redirect_to", it) }
         }
         val userInfo = response.safeBody<UserInfo>()
-        if (updateCurrentUser && sessionStatus.value is SessionStatus.Authenticated) {
-            val newSession =
-                (sessionStatus.value as SessionStatus.Authenticated).session.copy(user = userInfo)
-            if (this.config.autoSaveToStorage) {
-                sessionManager.saveSession(newSession)
+        sessionMutex.withLock {
+            if (updateCurrentUser && sessionStatus.value is SessionStatus.Authenticated) {
+                val newSession =
+                    (sessionStatus.value as SessionStatus.Authenticated).session.copy(user = userInfo)
+                updateSessionLocked(SessionStatus.Authenticated(newSession, SessionSource.UserChanged(newSession)))
             }
-            setSessionStatus(SessionStatus.Authenticated(newSession, SessionSource.UserChanged(newSession)))
         }
         return userInfo
     }
@@ -492,10 +508,11 @@ internal class AuthImpl(
     override suspend fun retrieveUserForCurrentSession(updateSession: Boolean): UserInfo {
         val user = retrieveUser(currentAccessTokenOrNull() ?: error("No session found"))
         if (updateSession) {
-            val session = currentSessionOrNull() ?: error("No session found")
-            val newStatus = SessionStatus.Authenticated(session.copy(user = user), SessionSource.UserChanged(currentSessionOrNull() ?: error("Session shouldn't be null")))
-            setSessionStatus(newStatus)
-            if (config.autoSaveToStorage) sessionManager.saveSession(newStatus.session)
+            sessionMutex.withLock {
+                val session = currentSessionOrNull() ?: error("No session found")
+                val newStatus = SessionStatus.Authenticated(session.copy(user = user), SessionSource.UserChanged(session))
+                updateSessionLocked(newStatus)
+            }
         }
         return user
     }
@@ -516,24 +533,35 @@ internal class AuthImpl(
         return session
     }
 
-    override suspend fun refreshSession(refreshToken: String): UserSession {
+    override suspend fun refreshSession(refreshToken: String): UserSession =
+        requestRefreshSession(refreshToken, sessionGeneration.load())
+
+    private suspend fun requestRefreshSession(refreshToken: String, generation: Any): UserSession {
         logger.d {
             "Refreshing session"
         }
         val body = buildJsonObject {
             put("refresh_token", refreshToken)
         }
-        val response = unauthenticatedApi.postJson("token?grant_type=refresh_token", body)
-        return response.safeBody("Auth#refreshSession")
+        return try {
+            withContext(RefreshRequest) {
+                val response = unauthenticatedApi.postJson("token?grant_type=refresh_token", body)
+                response.safeBody<UserSession>("Auth#refreshSession")
+            }
+        } catch (e: AuthSessionMissingException) {
+            sessionMutex.withLock {
+                if (sessionGeneration.load() === generation) clearSessionLocked()
+            }
+            throw e
+        }
     }
 
     override suspend fun refreshCurrentSession() {
-        val newSession = refreshSession(
-            currentSessionOrNull()?.refreshToken
-                ?: error("No refresh token found in current session")
-        )
-        importSession(newSession, source = SessionSource.Refresh(currentSessionOrNull() ?: error("No session found")))
-        updateRefreshInformation(null, Clock.System.now())
+        val (session, generation) = sessionMutex.withLock {
+            if (sessionImportPending) return
+            (currentSessionOrNull() ?: error("No refresh token found in current session")) to sessionGeneration.load()
+        }
+        refreshSessionIfCurrent(session, generation, config.alwaysAutoRefresh)
     }
 
     override suspend fun importSession(
@@ -548,6 +576,20 @@ internal class AuthImpl(
         source: SessionSource,
         initializing: Boolean
     ) {
+        val job = sessionMutex.withLock {
+            importSessionLocked(session, autoRefresh, source)
+        }
+        // Never join a job while holding the lock it needs to commit its result.
+        if (initializing) job?.join()
+    }
+
+    private suspend fun importSessionLocked(
+        session: UserSession,
+        autoRefresh: Boolean,
+        source: SessionSource
+    ): Job? {
+        sessionGeneration.store(Any())
+        sessionImportPending = false
         logger.d { "Importing session $session from $source, auto refresh is set to $autoRefresh." }
         if (!autoRefresh) {
             if (session.refreshToken.isNotBlank() && session.expiresIn != 0L && config.autoSaveToStorage) {
@@ -555,13 +597,15 @@ internal class AuthImpl(
                 logger.d { "Session saved to storage (no auto refresh)" }
             }
             setSessionStatus(SessionStatus.Authenticated(session, source))
+            stopAutoRefreshForCurrentSession()
             logger.d { "Session imported successfully." }
-            return
+            return null
         }
         val thresholdDate = session.expiresAt - session.expiresIn.seconds * (1 - SESSION_REFRESH_THRESHOLD)
         if (thresholdDate <= Clock.System.now()) {
+            sessionImportPending = true
             logger.d { "Session is under the threshold date. Refreshing session..." }
-            recreateSessionJob(session, source, false, initializing)
+            return recreateSessionJob(session, source, false)
         } else {
             if (config.autoSaveToStorage) {
                 sessionManager.saveSession(session)
@@ -569,34 +613,58 @@ internal class AuthImpl(
             }
             setSessionStatus(SessionStatus.Authenticated(session, source))
             logger.d { "Session imported successfully. Starting auto refresh..." }
-            recreateSessionJob(session, source, true, initializing)
+            val job = recreateSessionJob(session, source, true)
             logger.d { "Auto refresh started." }
+            return job
         }
     }
 
-    private suspend fun recreateSessionJob(
+    private suspend fun updateSessionLocked(status: SessionStatus.Authenticated, save: Boolean = true) {
+        if (save && config.autoSaveToStorage) sessionManager.saveSession(status.session)
+        setSessionStatus(status)
+        // A user/identity update invalidates in-flight refreshes as well, but
+        // must keep automatic refresh scheduled for the updated session.
+        if (isAutoRefreshRunning) recreateSessionJob(status.session, status.source, true)
+    }
+
+    private fun recreateSessionJob(
         session: UserSession,
         source: SessionSource,
-        delay: Boolean,
-        initializing: Boolean
-    ) {
+        delay: Boolean
+    ): Job {
         sessionJob?.cancel()
-        sessionJob = authScope.launch {
-            if(delay) delayBeforeExpiry(session)
+        val generation = sessionGeneration.load()
+        val job = authScope.launch {
+            if(delay) delayBeforeExpiry(session, generation)
             tryImportingSession(
-                { handleExpiredSession(session, config.alwaysAutoRefresh) },
-                { importSession(session, source = source) },
-                { updateStatusIfExpired(session, it) }
+                { refreshSessionIfCurrent(session, generation, config.alwaysAutoRefresh) },
+                {
+                    sessionMutex.withLock {
+                        if (sessionGeneration.load() === generation) importSessionLocked(session, config.alwaysAutoRefresh, source)
+                    }
+                },
+                {
+                    sessionMutex.withLock {
+                        if (sessionGeneration.load() === generation) updateStatusIfExpired(session, it)
+                    }
+                },
+                {
+                    sessionMutex.withLock {
+                        if (sessionGeneration.load() === generation) clearSessionLocked()
+                    }
+                }
             )
         }
-        if (initializing) sessionJob?.join()
+        sessionJob = job
+        return job
     }
 
     @Suppress("MagicNumber")
     private suspend fun tryImportingSession(
         importRefreshedSession: suspend () -> Unit,
         retry: suspend () -> Unit,
-        updateStatus: suspend (RefreshFailureCause) -> Unit
+        updateStatus: suspend (RefreshFailureCause) -> Unit,
+        clear: suspend () -> Unit
     ) {
         try {
             importRefreshedSession()
@@ -608,7 +676,7 @@ internal class AuthImpl(
                 retry()
             } else {
                 logger.e(e) { "Couldn't refresh session. The refresh token may have been revoked. Clearing session (Status code ${e.statusCode})... " }
-                clearSession()
+                clear()
             }
         } catch (e: Exception) {
             currentCoroutineContext().ensureActive()
@@ -627,7 +695,7 @@ internal class AuthImpl(
         emitEvent(AuthEvent.RefreshFailure(reason))
     }
 
-    private suspend fun delayBeforeExpiry(session: UserSession) {
+    private suspend fun delayBeforeExpiry(session: UserSession, generation: Any) {
         val now = Clock.System.now()
         val timeAtBeginningOfSession = session.expiresAt - session.expiresIn.seconds
 
@@ -635,7 +703,10 @@ internal class AuthImpl(
         val targetRefreshTime = timeAtBeginningOfSession + (session.expiresIn.seconds * SESSION_REFRESH_THRESHOLD)
 
         val delayDuration = targetRefreshTime - now
-        updateRefreshInformation(targetRefreshTime, null)
+        sessionMutex.withLock {
+            if (sessionGeneration.load() !== generation) return
+            updateRefreshInformation(targetRefreshTime, null)
+        }
         logger.d {
             "Refreshing session in $delayDuration."
         }
@@ -655,20 +726,29 @@ internal class AuthImpl(
             )
     }
 
-    private suspend fun handleExpiredSession(session: UserSession, autoRefresh: Boolean = true) {
+    private suspend fun refreshSessionIfCurrent(session: UserSession, generation: Any, autoRefresh: Boolean) {
         logger.d {
             "Session expired. Refreshing session..."
         }
-        val newSession = refreshSession(session.refreshToken)
-        importSession(newSession, autoRefresh, SessionSource.Refresh(session))
+        if (sessionGeneration.load() !== generation) return
+        val newSession = requestRefreshSession(session.refreshToken, generation)
+        sessionMutex.withLock {
+            if (sessionGeneration.load() !== generation) return
+            importSessionLocked(newSession, autoRefresh, SessionSource.Refresh(session))
+            updateRefreshInformation(null, Clock.System.now())
+        }
     }
 
-    override suspend fun startAutoRefreshForCurrentSession() =
-        importSession(
-            currentSessionOrNull() ?: error("No session found"),
-            true,
-            (sessionStatus.value as SessionStatus.Authenticated).source
-        )
+    override suspend fun startAutoRefreshForCurrentSession() {
+        sessionMutex.withLock {
+            if (sessionImportPending) return
+            importSessionLocked(
+                currentSessionOrNull() ?: error("No session found"),
+                true,
+                (sessionStatus.value as SessionStatus.Authenticated).source
+            )
+        }
+    }
 
     override fun stopAutoRefreshForCurrentSession() {
         logger.d { "Stopping auto refresh for current session" }
@@ -682,15 +762,31 @@ internal class AuthImpl(
     override suspend fun loadFromStorage(autoRefresh: Boolean): Boolean = loadFromStorage(autoRefresh, false)
 
     suspend fun loadFromStorage(autoRefresh: Boolean = config.alwaysAutoRefresh, initializing: Boolean): Boolean {
+        val generation = sessionMutex.withLock {
+            // Initialization may not start until after another operation has
+            // already established (or is importing) the authoritative session.
+            if (initializing && (sessionStatus.value !is SessionStatus.Initializing || sessionImportPending)) {
+                logger.d { "Skipping storage initialization because session authority has already changed." }
+                return false
+            }
+            sessionGeneration.load()
+        }
         val session = try { sessionManager.loadSession() } catch (e: Exception) {
             currentCoroutineContext().ensureActive()
             logger.e(e) { "Failed to load session" }
             null
+        } ?: return false
+        val job = sessionMutex.withLock {
+            if (sessionGeneration.load() !== generation) {
+                logger.d { "Ignoring stored session because session authority changed during the read." }
+                return@withLock null
+            }
+            importSessionLocked(session, autoRefresh, SessionSource.Storage)
         }
-        session?.let {
-            importSession(it, autoRefresh, SessionSource.Storage, initializing)
-        }
-        return session != null
+        // Keep initialization's job-waiting behavior outside the commit lock.
+        if (initializing) job?.join()
+        // This reports finding stored data, not whether it was still authoritative.
+        return true
     }
 
     override suspend fun close() {
@@ -700,7 +796,7 @@ internal class AuthImpl(
     override suspend fun parseErrorResponse(response: HttpResponse): RestException {
         val errorBody =
             supabaseClient.bodyOrNull<GoTrueErrorResponse>(response) ?: GoTrueErrorResponse("Unknown error", "")
-        checkErrorCodes(errorBody, response)?.let { return it }
+        checkErrorCodes(errorBody, response, currentCoroutineContext()[RefreshRequest.Key] != null)?.let { return it }
         return when (response.status) {
             HttpStatusCode.Unauthorized -> UnauthorizedRestException(
                 errorBody.error ?: "Unauthorized",
@@ -721,13 +817,16 @@ internal class AuthImpl(
         }
     }
 
-    private fun checkErrorCodes(error: GoTrueErrorResponse, response: HttpResponse): RestException? {
+    private fun checkErrorCodes(error: GoTrueErrorResponse, response: HttpResponse, refreshing: Boolean): RestException? {
         return when (error.error) {
             AuthWeakPasswordException.CODE -> AuthWeakPasswordException(error.description, response, error.weakPassword?.reasons ?: emptyList())
             AuthSessionMissingException.CODE -> {
-                authScope.launch {
+                val generation = sessionGeneration.load()
+                if (!refreshing) authScope.launch {
                     logger.e { "Received session not found api error. Clearing session..." }
-                    clearSession()
+                    sessionMutex.withLock {
+                        if (sessionGeneration.load() === generation) clearSessionLocked()
+                    }
                 }
                 AuthSessionMissingException(response)
             }
@@ -762,6 +861,12 @@ internal class AuthImpl(
     }
 
     override suspend fun clearSession() {
+        sessionMutex.withLock { clearSessionLocked() }
+    }
+
+    private suspend fun clearSessionLocked() {
+        sessionGeneration.store(Any())
+        sessionImportPending = false
         codeVerifierCache.deleteCodeVerifier()
         sessionManager.deleteSession()
         setSessionStatus(SessionStatus.NotAuthenticated(true))
@@ -773,6 +878,9 @@ internal class AuthImpl(
     }
 
     override fun setSessionStatus(status: SessionStatus) {
+        if (status is SessionStatus.Authenticated || status is SessionStatus.NotAuthenticated) {
+            sessionGeneration.store(Any())
+        }
         logger.d { "Setting session status to $status" }
         _sessionStatus.value = status
     }
