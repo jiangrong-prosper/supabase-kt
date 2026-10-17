@@ -13,6 +13,8 @@ import io.github.jan.supabase.testing.createMockedSupabaseClient
 import io.github.jan.supabase.testing.respondJson
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respondError
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.HttpTimeoutConfig
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
@@ -230,6 +232,12 @@ class AuthRefreshAuthorityTest {
         val client = createMockedSupabaseClient(configuration = {
             defaultLogLevel = LogLevel.NONE
             coroutineDispatcher = testDispatcher
+            // The gated manual request must survive advancing to the auto-refresh deadline.
+            httpConfig {
+                install(HttpTimeout) {
+                    requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
+                }
+            }
             httpEngine = MockEngine.create {
                 dispatcher = testDispatcher
                 addHandler {
