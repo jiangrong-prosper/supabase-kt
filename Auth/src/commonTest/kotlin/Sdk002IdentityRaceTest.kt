@@ -1,5 +1,6 @@
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.Auth
+import io.github.jan.supabase.auth.AuthImpl
 import io.github.jan.supabase.auth.MemorySessionManager
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.exception.SessionRequiredException
@@ -263,9 +264,177 @@ class Sdk002IdentityRaceTest {
         }
     }
 
+    @Test
+    fun signedOutSessionMustNotBeRestoredByUserUpdate() = userUpdateBoundary(UpdateBoundary.SIGN_OUT)
+
+    @Test
+    fun sameAccountReloginMustRejectEarlierUserUpdate() = userUpdateBoundary(UpdateBoundary.RELOGIN)
+
+    @Test
+    fun sameAccountImportMustRejectEarlierUserUpdate() = userUpdateBoundary(UpdateBoundary.IMPORT)
+
+    @Test
+    fun sameAccountRefreshAllowsUserUpdateWithoutRevertingTokens() = userUpdateBoundary(UpdateBoundary.REFRESH)
+
+    @Test
+    fun refreshedUserDataMustNotBeRevertedByEarlierUpdate() = userUpdateBoundary(UpdateBoundary.REFRESH_WITH_NEW_USER)
+
+    @Test
+    fun staleUserUpdateMustPreserveNewAccountRefreshJob() = userUpdateBoundary(UpdateBoundary.SWITCH_WITH_AUTO_REFRESH)
+
+    @Test
+    fun newerUserUpdateMustNotBeRevertedByEarlierResponse() = userUpdateBoundary(UpdateBoundary.NEWER_UPDATE)
+
+    @Test
+    fun resolverCredentialOverrideMustNotUpdateUnboundSession() = userUpdateBoundary(UpdateBoundary.OVERRIDE_TOKEN)
+
+    @Test
+    fun sessionWithoutUserProfileCanAcceptBoundUserUpdate() = userUpdateBoundary(UpdateBoundary.WITHOUT_PROFILE)
+
+    private enum class UpdateBoundary {
+        SIGN_OUT, RELOGIN, IMPORT, REFRESH, REFRESH_WITH_NEW_USER,
+        SWITCH_WITH_AUTO_REFRESH, NEWER_UPDATE, OVERRIDE_TOKEN, WITHOUT_PROFILE
+    }
+
+    private fun userUpdateBoundary(boundary: UpdateBoundary) = runTest(timeout = 30.seconds) {
+        val a = session("A")
+        val initial = if (boundary == UpdateBoundary.WITHOUT_PROFILE) a.copy(user = null) else a
+        val updatedUser = requireNotNull(a.user).copy(email = "updated-a@example.invalid")
+        val newerUser = requireNotNull(a.user).copy(email = "newer-a@example.invalid")
+        val renewed = a.copy(
+            accessToken = "sdk002-renewed-access-A",
+            refreshToken = "sdk002-renewed-refresh-A",
+            expiresAt = Instant.parse("2031-01-01T00:00:00Z"),
+            user = if (boundary == UpdateBoundary.REFRESH_WITH_NEW_USER) newerUser else a.user
+        )
+        val overrideToken = if (boundary == UpdateBoundary.OVERRIDE_TOKEN) "sdk002-override-access-A" else null
+        val storage = MemorySessionManager()
+        val requestEntered = CompletableDeferred<String?>()
+        val releaseResponse = CompletableDeferred<Unit>()
+        var updates = 0
+        var refreshes = 0
+        var logouts = 0
+        val client = controlledClient(storage, jwtToken = overrideToken) { request ->
+            when (request.url.pathAfterVersion()) {
+                "/user" -> {
+                    assertEquals(HttpMethod.Put, request.method)
+                    updates++
+                    if (updates == 1) {
+                        requestEntered.complete(request.headers["Authorization"])
+                        releaseResponse.await()
+                        respondJson(updatedUser)
+                    } else {
+                        assertTrue(boundary == UpdateBoundary.NEWER_UPDATE && updates == 2)
+                        assertTrue(request.headers["Authorization"] == "Bearer ${a.accessToken}")
+                        respondJson(newerUser)
+                    }
+                }
+                "/token" -> {
+                    assertEquals(HttpMethod.Post, request.method)
+                    assertTrue(boundary == UpdateBoundary.REFRESH || boundary == UpdateBoundary.REFRESH_WITH_NEW_USER)
+                    assertEquals("refresh_token", request.url.parameters["grant_type"])
+                    assertTrue(request.body.toJsonElement().jsonObject["refresh_token"]?.jsonPrimitive?.content == a.refreshToken)
+                    refreshes++
+                    respondJson(renewed)
+                }
+                "/logout" -> {
+                    assertEquals(HttpMethod.Post, request.method)
+                    assertTrue(boundary == UpdateBoundary.SIGN_OUT || boundary == UpdateBoundary.RELOGIN)
+                    assertTrue(request.headers["Authorization"] == "Bearer ${a.accessToken}")
+                    logouts++
+                    respondJson("{}")
+                }
+                else -> error("Unexpected request in user-update boundary test")
+            }
+        }
+        try {
+            runCurrent()
+            client.auth.awaitInitialization()
+            client.auth.importSession(initial, source = SessionSource.External)
+            val update = async { client.auth.updateUser { email = updatedUser.email } }
+            runCurrent()
+            assertTrue(requestEntered.isCompleted)
+            val authorization = requestEntered.await()
+            assertTrue(authorization == "Bearer ${overrideToken ?: a.accessToken}")
+            assertFalse(update.isCompleted)
+            when (boundary) {
+                UpdateBoundary.SIGN_OUT, UpdateBoundary.RELOGIN -> {
+                    val logout = async { client.auth.signOut() }
+                    runCurrent()
+                    assertTrue(logout.isCompleted)
+                    logout.await()
+                    assertNull(client.auth.currentSessionOrNull())
+                    assertNull(storage.loadSessionOrNull())
+                    if (boundary == UpdateBoundary.RELOGIN) {
+                        client.auth.importSession(renewed, source = SessionSource.External)
+                    }
+                }
+                UpdateBoundary.IMPORT -> client.auth.importSession(renewed.copy(user = newerUser), source = SessionSource.External)
+                UpdateBoundary.REFRESH, UpdateBoundary.REFRESH_WITH_NEW_USER -> {
+                    val refresh = async { client.auth.refreshCurrentSession() }
+                    runCurrent()
+                    assertTrue(refresh.isCompleted)
+                    refresh.await()
+                    assertTrue(client.auth.currentSessionOrNull() == renewed)
+                    assertTrue(storage.loadSessionOrNull() == renewed)
+                    assertIs<SessionSource.Refresh>(assertIs<SessionStatus.Authenticated>(client.auth.sessionStatus.value).source)
+                }
+                UpdateBoundary.SWITCH_WITH_AUTO_REFRESH -> client.auth.importSession(session("B"), autoRefresh = true, source = SessionSource.External)
+                UpdateBoundary.NEWER_UPDATE -> {
+                    val newer = async { client.auth.updateUser { email = newerUser.email } }
+                    runCurrent()
+                    assertTrue(newer.isCompleted)
+                    assertTrue(newer.await() == newerUser)
+                    assertTrue(client.auth.currentSessionOrNull() == a.copy(user = newerUser))
+                }
+                UpdateBoundary.OVERRIDE_TOKEN, UpdateBoundary.WITHOUT_PROFILE -> Unit
+            }
+            runCurrent()
+            val before = client.auth.sessionStatus.value
+            val beforeSession = client.auth.currentSessionOrNull()
+            val beforeStored = storage.loadSessionOrNull()
+            val auth = client.auth as AuthImpl
+            val refreshJob = auth.sessionJob
+            val refreshInformation = auth.autoRefreshInformation()
+            if (boundary == UpdateBoundary.SWITCH_WITH_AUTO_REFRESH) assertTrue(refreshJob?.isActive == true)
+            val observationTime = testScheduler.currentTime
+            releaseResponse.complete(Unit)
+            runCurrent()
+            assertTrue(update.isCompleted)
+            assertTrue(update.await() == updatedUser)
+            assertTrue(testScheduler.currentTime == observationTime)
+            assertTrue(updates == if (boundary == UpdateBoundary.NEWER_UPDATE) 2 else 1)
+            assertTrue(refreshes == if (boundary == UpdateBoundary.REFRESH || boundary == UpdateBoundary.REFRESH_WITH_NEW_USER) 1 else 0)
+            assertTrue(logouts == if (boundary == UpdateBoundary.SIGN_OUT || boundary == UpdateBoundary.RELOGIN) 1 else 0)
+            val accept = boundary == UpdateBoundary.REFRESH || boundary == UpdateBoundary.WITHOUT_PROFILE
+            val expected = if (accept) requireNotNull(beforeSession).copy(user = updatedUser) else beforeSession
+            val current = client.auth.currentSessionOrNull()
+            val persisted = storage.loadSessionOrNull()
+            println(
+                "SDK002 boundary=$boundary; requestMatchesCapturedCredential=${authorization == "Bearer ${a.accessToken}"}; " +
+                    "currentUser=${current?.user?.id}; localCommitAllowed=$accept; currentMatches=${current == expected}; " +
+                    "storedMatches=${persisted == expected}; source=${sourceName(client.auth.sessionStatus.value)}; " +
+                    "refreshJobPreserved=${auth.sessionJob === refreshJob}"
+            )
+            assertTrue(current == expected)
+            assertTrue(persisted == if (accept) expected else beforeStored)
+            if (accept) {
+                assertIs<SessionSource.UserChanged>(assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value).source)
+            } else {
+                assertTrue(auth.sessionStatus.value === before)
+                assertTrue(auth.sessionJob === refreshJob)
+                assertTrue(auth.autoRefreshInformation() == refreshInformation)
+            }
+            assertTrue(auth.isAutoRefreshRunning == (boundary == UpdateBoundary.SWITCH_WITH_AUTO_REFRESH))
+        } finally {
+            client.close()
+        }
+    }
+
     private fun TestScope.controlledClient(
         storage: MemorySessionManager,
         requireSession: Boolean = false,
+        jwtToken: String? = null,
         handler: MockRequestHandler
     ): SupabaseClient {
         val testDispatcher = StandardTestDispatcher(testScheduler)
@@ -282,6 +451,7 @@ class Sdk002IdentityRaceTest {
                 autoSaveToStorage = true
                 alwaysAutoRefresh = false
                 requireValidSession = requireSession
+                this.jwtToken = jwtToken
             }
         })
     }
