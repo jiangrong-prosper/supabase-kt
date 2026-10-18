@@ -12,6 +12,7 @@ import io.github.jan.supabase.annotations.SupabaseInternal
 import io.github.jan.supabase.auth.admin.AdminApi
 import io.github.jan.supabase.auth.admin.AdminApiImpl
 import io.github.jan.supabase.auth.api.authenticatedSupabaseApi
+import io.github.jan.supabase.auth.api.AuthenticatedSupabaseApi
 import io.github.jan.supabase.auth.event.AuthEvent
 import io.github.jan.supabase.auth.exception.AuthRestException
 import io.github.jan.supabase.auth.exception.AuthSessionMissingException
@@ -52,16 +53,22 @@ import io.github.jan.supabase.logging.createLogger
 import io.github.jan.supabase.logging.d
 import io.github.jan.supabase.logging.e
 import io.github.jan.supabase.logging.i
-import io.github.jan.supabase.network.supabaseApi
+import io.github.jan.supabase.network.SupabaseApi
+import io.github.jan.supabase.network.SupabaseHttpClient
 import io.github.jan.supabase.putJsonObject
 import io.github.jan.supabase.safeBody
 import io.github.jan.supabase.supabaseJson
 import io.ktor.client.request.parameter
+import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.HttpStatement
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpMethod
+import io.ktor.http.Headers
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.encodeURLParameter
+import io.ktor.util.AttributeKey
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
@@ -106,6 +113,19 @@ private object RefreshRequest : AbstractCoroutineContextElement(Key) {
 // Refreshes advance the generation while retaining user-update authority. Other
 // session operations establish new authority, including a same-account sign-in.
 private class SessionGeneration(val userUpdateAuthority: Any = Any())
+
+private class SessionRequestGeneration(val generation: Any, val clearOnError: Boolean = true) : AbstractCoroutineContextElement(Key) {
+    companion object Key : CoroutineContext.Key<SessionRequestGeneration>
+}
+
+private class SessionRequestAuthority(
+    val generation: Any,
+    val verifierGeneration: Any,
+    val accessToken: String?,
+    val authorization: String?
+)
+private val SESSION_REQUEST_AUTHORITY = AttributeKey<SessionRequestAuthority>("AuthSessionRequestAuthority")
+private val SESSION_ERROR_CLEANUP = AttributeKey<Boolean>("AuthSessionErrorCleanup")
 
 internal sealed interface SessionImportResult {
     data class Committed(
@@ -165,6 +185,9 @@ internal class AuthImpl(
     // same authority generation, while storage and status changes are serialized.
     private val sessionMutex = Mutex()
     private val sessionGeneration = AtomicReference(SessionGeneration())
+    // PKCE preparation is synchronous but saving is suspendable. Register ownership
+    // before queuing the save so an older logout cannot delete a newer flow's verifier.
+    private val codeVerifierGeneration = AtomicReference(Any())
     private var sessionImportPending = false
     override val sessionStatus: StateFlow<SessionStatus> = _sessionStatus.asStateFlow()
     private val _events = MutableSharedFlow<AuthEvent>(replay = 1)
@@ -174,11 +197,48 @@ internal class AuthImpl(
     override val sessionManager = config.sessionManager ?: createDefaultSessionManager()
     override val codeVerifierCache = config.codeVerifierCache ?: createDefaultCodeVerifierCache()
 
-    internal val publicApi = supabaseClient.authenticatedSupabaseApi(this, requireSession = false)
+    // Stamp each Auth request before network execution. Response parsing must never
+    // obtain fresh authority for an old request. Unattributed credentials cannot clear a session.
+    private val authorityHttpClient = object : SupabaseHttpClient() {
+        override suspend fun getDefaultHeaders(): Headers = supabaseClient.httpClient.getDefaultHeaders()
+
+        private suspend fun attributed(builder: HttpRequestBuilder.() -> Unit): HttpRequestBuilder.() -> Unit {
+            val (generation, session) = sessionMutex.withLock { sessionGeneration.load() to currentSessionOrNull() }
+            val operation = currentCoroutineContext()[SessionRequestGeneration]
+            val expectedGeneration = operation?.generation ?: generation
+            val verifierGeneration = codeVerifierGeneration.load()
+            return {
+                builder()
+                attributes.put(SESSION_REQUEST_AUTHORITY, SessionRequestAuthority(
+                    expectedGeneration,
+                    verifierGeneration,
+                    session?.accessToken?.takeIf { operation?.clearOnError != false && attributes.getOrNull(SESSION_ERROR_CLEANUP) == true },
+                    headers["Authorization"]
+                ))
+            }
+        }
+
+        override suspend fun request(url: String, builder: HttpRequestBuilder.() -> Unit): HttpResponse =
+            supabaseClient.httpClient.request(url, attributed(builder))
+
+        override suspend fun prepareRequest(url: String, builder: HttpRequestBuilder.() -> Unit): HttpStatement =
+            supabaseClient.httpClient.prepareRequest(url, attributed(builder))
+    }
+
+    private fun sessionApi(requireSession: Boolean, sessionBound: Boolean): AuthenticatedSupabaseApi {
+        val api = supabaseClient.authenticatedSupabaseApi(this, requireSession = requireSession, defaultRequest = {
+            attributes.put(SESSION_ERROR_CLEANUP, sessionBound)
+        })
+        return AuthenticatedSupabaseApi(authorityHttpClient, api.config)
+    }
+
+    // OTP/login/public operations use their own credentials; their errors do not
+    // establish that an unrelated current bearer session is invalid.
+    internal val publicApi = sessionApi(requireSession = false, sessionBound = false)
     @OptIn(SupabaseInternal::class)
-    internal val unauthenticatedApi = supabaseClient.supabaseApi(this)
+    internal val unauthenticatedApi = SupabaseApi(::resolveUrl, ::parseErrorResponse, authorityHttpClient)
     @OptIn(SupabaseInternal::class)
-    internal val userApi = if(config.requireValidSession) supabaseClient.authenticatedSupabaseApi(this) else publicApi
+    internal val userApi = sessionApi(requireSession = config.requireValidSession, sessionBound = true)
     override val admin: AdminApi = AdminApiImpl(publicApi)
     override val mfa: MfaApi = MfaApiImpl(userApi.resolve("factors"), this)
     var sessionJob: Job? = null
@@ -341,8 +401,9 @@ internal class AuthImpl(
         redirectUrl: String?,
         config: UserUpdateBuilder.() -> Unit
     ): UserInfo {
-        val (requestSession, userUpdateAuthority) = sessionMutex.withLock {
-            currentSessionOrNull() to sessionGeneration.load().userUpdateAuthority
+        val (requestSession, userUpdateAuthority, generation) = sessionMutex.withLock {
+            val generation = sessionGeneration.load()
+            Triple(currentSessionOrNull(), generation.userUpdateAuthority, generation)
         }
         val requestAuthorization = AtomicReference<String?>(null)
         val updateBuilder = UserUpdateBuilder(serializer = serializer).apply(config)
@@ -351,11 +412,13 @@ internal class AuthImpl(
             putJsonObject(supabaseJson.encodeToJsonElement(updateBuilder).jsonObject)
             codeChallenge?.let(::putCodeChallenge)
         }.toString()
-        val response = userApi.putJson("user", body) {
-            redirectUrl?.let { url.parameters.append("redirect_to", it) }
-            // Observe the resolver's selected credential rather than assuming
-            // it still equals the session captured before the HTTP operation.
-            requestAuthorization.store(headers["Authorization"])
+        val response = withSessionGeneration(generation) {
+            userApi.putJson("user", body) {
+                redirectUrl?.let { url.parameters.append("redirect_to", it) }
+                // Observe the resolver's selected credential rather than assuming
+                // it still equals the session captured before the HTTP operation.
+                requestAuthorization.store(headers["Authorization"])
+            }
         }
         val userInfo = response.safeBody<UserInfo>()
         sessionMutex.withLock {
@@ -421,10 +484,16 @@ internal class AuthImpl(
     }
 
     override suspend fun signOut(scope: SignOutScope) {
-        if (currentSessionOrNull() != null) {
+        val (generation, session, verifier) = sessionMutex.withLock {
+            Triple(sessionGeneration.load(), currentSessionOrNull(), codeVerifierGeneration.load() to codeVerifierCache.loadCodeVerifier())
+        }
+        if (session != null) {
             try {
-                userApi.post("logout") {
-                    parameter("scope", scope.name.lowercase())
+                withSessionGeneration(generation, clearOnError = false) {
+                    userApi.post("logout") {
+                        headers["Authorization"] = "Bearer ${session.accessToken}"
+                        parameter("scope", scope.name.lowercase())
+                    }
                 }
             } catch(e: RestException) {
                 if(e.statusCode in SIGN_OUT_IGNORE_CODES) {
@@ -436,7 +505,14 @@ internal class AuthImpl(
             logger.i { "Skipping session logout as there is no session available. Proceeding to clean up local data..." }
         }
         if (scope != SignOutScope.OTHERS) {
-            clearSession()
+            sessionMutex.withLock {
+                if (sessionGeneration.load() === generation) {
+                    clearSessionLocked(
+                        deleteVerifier = codeVerifierCache.loadCodeVerifier() == verifier.second,
+                        expectedVerifierGeneration = verifier.first
+                    )
+                }
+            }
         }
         logger.d { "Successfully logged out" }
     }
@@ -447,19 +523,23 @@ internal class AuthImpl(
         captchaToken: String?,
         additionalData: JsonObjectBuilder.() -> Unit
     ): OtpVerifyResult {
+        val generation = captureSessionGeneration()
         val body = buildJsonObject {
             put("type", type)
             token?.let { put("token", it) }
             captchaToken?.let(::putCaptchaToken)
             additionalData()
         }
-        val response = publicApi.postJson("verify", body)
+        val response = withSessionGeneration(generation) { publicApi.postJson("verify", body) }
         val session = supabaseClient.bodyOrNull<UserSession>(response)
         if(session == null) {
-            logger.d { "Received `verifyOtp` response without session: ${response.bodyAsText()}. This may occur if changing the email with 'Secure email change' enabled" }
+            logger.d { "Received `verifyOtp` response without session. This may occur if changing the email with 'Secure email change' enabled" }
             return OtpVerifyResult.VerifiedNoSession
         }
-        importSession(session, source = SessionSource.SignIn(OTP))
+        sessionMutex.withLock {
+            if (sessionGeneration.load() !== generation) throw CancellationException("OTP authentication was superseded")
+            importSessionLocked(session, config.alwaysAutoRefresh, SessionSource.SignIn(OTP))
+        }
         return OtpVerifyResult.Authenticated(session)
     }
 
@@ -554,18 +634,27 @@ internal class AuthImpl(
     }
 
     override suspend fun retrieveUser(jwt: String): UserInfo {
-        val response = userApi.get("user") {
-            headers["Authorization"] = "Bearer $jwt"
+        val generation = currentCoroutineContext()[SessionRequestGeneration]?.generation ?: captureSessionGeneration()
+        val response = withSessionGeneration(generation) {
+            userApi.get("user") {
+                headers["Authorization"] = "Bearer $jwt"
+            }
         }
         val body = response.bodyAsText()
         return supabaseJson.decodeFromString(body)
     }
 
     override suspend fun retrieveUserForCurrentSession(updateSession: Boolean): UserInfo {
-        val user = retrieveUser(currentAccessTokenOrNull() ?: error("No session found"))
+        val (generation, requestSession) = sessionMutex.withLock {
+            sessionGeneration.load() to (currentSessionOrNull() ?: error("No session found"))
+        }
+        val user = withSessionGeneration(generation) { retrieveUser(requestSession.accessToken) }
         if (updateSession) {
             sessionMutex.withLock {
-                val session = currentSessionOrNull() ?: error("No session found")
+                val session = currentSessionOrNull()
+                if (sessionGeneration.load() !== generation || session == null || session != requestSession ||
+                    (requestSession.user != null && requestSession.user.id != user.id)
+                ) return@withLock
                 val newStatus = SessionStatus.Authenticated(session.copy(user = user), SessionSource.UserChanged(session))
                 updateSessionLocked(newStatus)
             }
@@ -574,29 +663,45 @@ internal class AuthImpl(
     }
 
     override suspend fun exchangeCodeForSession(code: String, saveSession: Boolean): UserSession {
-        val codeVerifier = codeVerifierCache.loadCodeVerifier()
+        val (generation, verifierGeneration, codeVerifier) = sessionMutex.withLock {
+            Triple(sessionGeneration.load(), codeVerifierGeneration.load(), codeVerifierCache.loadCodeVerifier())
+        }
         require(codeVerifier != null) {
             "No code verifier stored. Make sure to use `getOAuthUrl` for the OAuth Url to prepare the PKCE flow."
         }
-        val session = unauthenticatedApi.postJson("token?grant_type=pkce", buildJsonObject {
-            put("auth_code", code)
-            put("code_verifier", codeVerifier)
-        }).safeBody<UserSession>()
-        codeVerifierCache.deleteCodeVerifier()
-        if (saveSession) {
-            importSession(session, source = SessionSource.External)
+        val session = withSessionGeneration(generation) {
+            unauthenticatedApi.postJson("token?grant_type=pkce", buildJsonObject {
+                put("auth_code", code)
+                put("code_verifier", codeVerifier)
+            }).safeBody<UserSession>()
+        }
+        sessionMutex.withLock {
+            if (sessionGeneration.load() !== generation || codeVerifierCache.loadCodeVerifier() != codeVerifier ||
+                !codeVerifierGeneration.compareAndSet(verifierGeneration, Any())
+            ) {
+                if (saveSession) throw CancellationException("PKCE authentication was superseded")
+                return@withLock
+            }
+            codeVerifierCache.deleteCodeVerifier()
+            if (saveSession) importSessionLocked(session, config.alwaysAutoRefresh, SessionSource.External)
         }
         return session
     }
 
-    override suspend fun refreshSession(refreshToken: String): UserSession =
-        requestRefreshSession(refreshToken, sessionGeneration.load())
+    override suspend fun refreshSession(refreshToken: String): UserSession {
+        val generation = sessionMutex.withLock {
+            // An explicit token belonging to an unknown identity has no cleanup authority.
+            if (currentSessionOrNull()?.refreshToken == refreshToken) sessionGeneration.load() else Any()
+        }
+        return requestRefreshSession(refreshToken, generation)
+    }
 
     private suspend fun requestRefreshSession(
         refreshToken: String,
         generation: Any,
         acknowledgement: SessionImportAcknowledgement? = null
     ): UserSession {
+        val verifierGeneration = codeVerifierGeneration.load()
         logger.d {
             "Refreshing session"
         }
@@ -612,7 +717,7 @@ internal class AuthImpl(
             sessionMutex.withLock {
                 if (sessionGeneration.load() === generation) {
                     acknowledgement?.complete(SessionImportResult.NotCommitted(e))
-                    clearSessionLocked()
+                    clearSessionLocked(expectedVerifierGeneration = verifierGeneration)
                 } else acknowledgement?.complete(SessionImportResult.Invalidated)
             }
             throw e
@@ -633,14 +738,24 @@ internal class AuthImpl(
         source: SessionSource
     ) = importSession(session, autoRefresh, source, false)
 
+    internal fun captureSessionGeneration(): Any = sessionGeneration.load()
+
+    internal suspend fun <T> withSessionGeneration(
+        generation: Any,
+        clearOnError: Boolean = true,
+        block: suspend () -> T
+    ): T = withContext(SessionRequestGeneration(generation, clearOnError)) { block() }
+
     internal suspend fun importSessionWithAcknowledgement(
         session: UserSession,
         autoRefresh: Boolean = config.alwaysAutoRefresh,
-        source: SessionSource = SessionSource.External
+        source: SessionSource = SessionSource.External,
+        expectedGeneration: Any? = null
     ): SessionImportResult {
         val acknowledgement = SessionImportAcknowledgement()
         try {
             sessionMutex.withLock {
+                if (expectedGeneration != null && sessionGeneration.load() !== expectedGeneration) return SessionImportResult.Invalidated
                 importSessionLocked(session, autoRefresh, source, acknowledgement = acknowledgement)
             }
         } catch (e: Throwable) {
@@ -679,7 +794,7 @@ internal class AuthImpl(
         sessionGeneration.store(SessionGeneration(userUpdateAuthority))
         acknowledgement?.generation?.store(sessionGeneration.load())
         sessionImportPending = false
-        logger.d { "Importing session $session from $source, auto refresh is set to $autoRefresh." }
+        logger.d { "Importing session; auto refresh is set to $autoRefresh." }
         if (!autoRefresh) {
             if (session.refreshToken.isNotBlank() && session.expiresIn != 0L && config.autoSaveToStorage) {
                 sessionManager.saveSession(session)
@@ -731,6 +846,7 @@ internal class AuthImpl(
         val attempt = acknowledgement?.newAttempt()
         sessionJob?.cancel()
         val generation = sessionGeneration.load()
+        val verifierGeneration = codeVerifierGeneration.load()
         val job = authScope.launch {
             if(delay) delayBeforeExpiry(session, generation)
             tryImportingSession(
@@ -752,7 +868,7 @@ internal class AuthImpl(
                     sessionMutex.withLock {
                         if (sessionGeneration.load() === generation) {
                             acknowledgement?.complete(SessionImportResult.NotCommitted())
-                            clearSessionLocked()
+                            clearSessionLocked(expectedVerifierGeneration = verifierGeneration)
                         } else acknowledgement?.notCommitted(sessionGeneration.load())
                     }
                 }
@@ -779,17 +895,17 @@ internal class AuthImpl(
             importRefreshedSession()
         } catch (e: RestException) {
             if (e.statusCode in NETWORK_ERROR_CODES) {
-                logger.e(e) { "Couldn't refresh session due to an internal server error. Retrying in ${config.retryDelay} (Status code ${e.statusCode})..." }
+                logger.e { "Couldn't refresh session due to an internal server error. Retrying in ${config.retryDelay} (Status code ${e.statusCode})..." }
                 updateStatus(RefreshFailureCause.InternalServerError(e))
                 delay(config.retryDelay)
                 retry()
             } else {
-                logger.e(e) { "Couldn't refresh session. The refresh token may have been revoked. Clearing session (Status code ${e.statusCode})... " }
+                logger.e { "Couldn't refresh session. The refresh token may have been revoked. Clearing session (Status code ${e.statusCode})... " }
                 clear()
             }
         } catch (e: Exception) {
             currentCoroutineContext().ensureActive()
-            logger.d(e) { "Couldn't reach Supabase. Either the address doesn't exist or the network might not be on. Retrying in ${config.retryDelay}..." }
+            logger.d { "Couldn't reach Supabase (${e::class.simpleName}). Retrying in ${config.retryDelay}..." }
             updateStatus(RefreshFailureCause.NetworkError(e))
             delay(config.retryDelay)
             retry()
@@ -893,7 +1009,7 @@ internal class AuthImpl(
         }
         val session = try { sessionManager.loadSession() } catch (e: Exception) {
             currentCoroutineContext().ensureActive()
-            logger.e(e) { "Failed to load session" }
+            logger.e { "Failed to load session (${e::class.simpleName})" }
             null
         } ?: return false
         val job = sessionMutex.withLock {
@@ -941,11 +1057,15 @@ internal class AuthImpl(
         return when (error.error) {
             AuthWeakPasswordException.CODE -> AuthWeakPasswordException(error.description, response, error.weakPassword?.reasons ?: emptyList())
             AuthSessionMissingException.CODE -> {
-                val generation = sessionGeneration.load()
-                if (!refreshing) authScope.launch {
-                    logger.e { "Received session not found api error. Clearing session..." }
+                val authority = response.call.request.attributes.getOrNull(SESSION_REQUEST_AUTHORITY)
+                if (!refreshing && authority != null && authority.accessToken != null &&
+                    authority.authorization == "Bearer ${authority.accessToken}"
+                ) authScope.launch {
                     sessionMutex.withLock {
-                        if (sessionGeneration.load() === generation) clearSessionLocked()
+                        if (sessionGeneration.load() === authority.generation && currentAccessTokenOrNull() == authority.accessToken) {
+                            logger.e { "Received session not found api error for the current request authority. Clearing session..." }
+                            clearSessionLocked(expectedVerifierGeneration = authority.verifierGeneration)
+                        }
                     }
                 }
                 AuthSessionMissingException(response)
@@ -984,10 +1104,16 @@ internal class AuthImpl(
         sessionMutex.withLock { clearSessionLocked() }
     }
 
-    private suspend fun clearSessionLocked() {
+    private suspend fun clearSessionLocked(deleteVerifier: Boolean = true, expectedVerifierGeneration: Any? = null) {
         sessionGeneration.store(SessionGeneration())
         sessionImportPending = false
-        codeVerifierCache.deleteCodeVerifier()
+        val ownsVerifier = deleteVerifier && if (expectedVerifierGeneration == null) {
+            codeVerifierGeneration.store(Any())
+            true
+        } else codeVerifierGeneration.compareAndSet(expectedVerifierGeneration, Any())
+        if (ownsVerifier) {
+            codeVerifierCache.deleteCodeVerifier()
+        }
         sessionManager.deleteSession()
         setSessionStatus(SessionStatus.NotAuthenticated(true))
         stopAutoRefreshForCurrentSession()
@@ -1005,12 +1131,12 @@ internal class AuthImpl(
         if (status is SessionStatus.Authenticated || status is SessionStatus.NotAuthenticated) {
             sessionGeneration.store(SessionGeneration(userUpdateAuthority))
         }
-        logger.d { "Setting session status to $status" }
+        logger.d { "Setting session status to ${status::class.simpleName}" }
         _sessionStatus.value = status
     }
 
     override fun emitEvent(event: AuthEvent) {
-        logger.d { "Emitting event $event" }
+        logger.d { "Emitting event ${event::class.simpleName}" }
         _events.tryEmit(event)
     }
 
@@ -1020,8 +1146,12 @@ internal class AuthImpl(
     private fun preparePKCEIfEnabled(): String? {
         if (this.config.flowType != FlowType.PKCE) return null
         val codeVerifier = generateCodeVerifier()
+        val verifierGeneration = Any()
+        codeVerifierGeneration.store(verifierGeneration)
         authScope.launch {
-            supabaseClient.auth.codeVerifierCache.saveCodeVerifier(codeVerifier)
+            sessionMutex.withLock {
+                if (codeVerifierGeneration.load() === verifierGeneration) codeVerifierCache.saveCodeVerifier(codeVerifier)
+            }
         }
         return generateCodeChallenge(codeVerifier)
     }

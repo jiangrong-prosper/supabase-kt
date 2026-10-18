@@ -2,12 +2,18 @@ import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.auth.AuthImpl
 import io.github.jan.supabase.auth.CodeVerifierCache
+import io.github.jan.supabase.auth.FlowType
+import io.github.jan.supabase.auth.OtpType
+import io.github.jan.supabase.auth.OtpVerifyResult
+import io.github.jan.supabase.auth.SignOutScope
 import io.github.jan.supabase.auth.MemoryCodeVerifierCache
 import io.github.jan.supabase.auth.MemorySessionManager
 import io.github.jan.supabase.auth.SessionManager
 import io.github.jan.supabase.auth.SessionImportResult
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.exception.SessionRequiredException
+import io.github.jan.supabase.auth.exception.AuthSessionMissingException
+import io.github.jan.supabase.auth.providers.Google
 import io.github.jan.supabase.auth.parseFragmentAndImportSession
 import io.github.jan.supabase.auth.status.SessionSource
 import io.github.jan.supabase.auth.status.SessionStatus
@@ -15,6 +21,7 @@ import io.github.jan.supabase.auth.user.UserInfo
 import io.github.jan.supabase.auth.user.UserSession
 import io.github.jan.supabase.exceptions.UnauthorizedRestException
 import io.github.jan.supabase.logging.LogLevel
+import io.github.jan.supabase.logging.SupabaseLoggingProcessor
 import io.github.jan.supabase.testing.createMockedSupabaseClient
 import io.github.jan.supabase.testing.pathAfterVersion
 import io.github.jan.supabase.testing.respondJson
@@ -26,6 +33,7 @@ import io.ktor.client.engine.mock.respondError
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -1078,6 +1086,606 @@ class Sdk002IdentityRaceTest {
         }
     }
 
+    @Test
+    fun recoveryLookupCannotOverwriteNewAccount() = recoveryLookupBoundary(AsyncBoundary.NEW_ACCOUNT)
+
+    @Test
+    fun recoveryLookupCannotRestoreSignedOutSession() = recoveryLookupBoundary(AsyncBoundary.SIGN_OUT)
+
+    @Test
+    fun recoveryLookupCannotOverwriteSameAccountRelogin() = recoveryLookupBoundary(AsyncBoundary.RELOGIN)
+
+    @Test
+    fun queuedRecoveryCannotAcquireReplacementAuthority() = recoveryLookupBoundary(AsyncBoundary.NEW_ACCOUNT, queued = true)
+
+    private enum class AsyncBoundary { CURRENT, NEW_ACCOUNT, RELOGIN, SIGN_OUT }
+
+    private fun asyncReplacement(boundary: AsyncBoundary): UserSession? = when (boundary) {
+        AsyncBoundary.CURRENT -> session("A")
+        AsyncBoundary.NEW_ACCOUNT -> session("B")
+        AsyncBoundary.RELOGIN -> session("A").copy(accessToken = "sdk002-new-login-access-A", refreshToken = "sdk002-new-login-refresh-A")
+        AsyncBoundary.SIGN_OUT -> null
+    }
+
+    private suspend fun changeAsyncAuthority(auth: Auth, boundary: AsyncBoundary) {
+        if (boundary == AsyncBoundary.SIGN_OUT || boundary == AsyncBoundary.RELOGIN) auth.signOut()
+        if (boundary == AsyncBoundary.NEW_ACCOUNT || boundary == AsyncBoundary.RELOGIN) {
+            auth.importSession(requireNotNull(asyncReplacement(boundary)), source = SessionSource.External)
+        }
+    }
+
+    private suspend fun assertAsyncAuthority(auth: Auth, storage: SessionManager, expected: UserSession?, status: SessionStatus) {
+        assertTrue(auth.currentSessionOrNull() == expected)
+        assertTrue(storage.loadSessionOrNull() == expected)
+        assertTrue(auth.sessionStatus.value === status)
+    }
+
+    private fun recoveryLookupBoundary(boundary: AsyncBoundary, queued: Boolean = false) = runTest(timeout = 30.seconds) {
+        val candidate = session("A").copy(accessToken = "sdk002-recovery-access-A", refreshToken = "sdk002-recovery-refresh-A", type = "recovery")
+        val storage = MemorySessionManager()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var callbacks = 0
+        var lookups = 0
+        val client = controlledClient(storage, codeVerifierCache = MemoryCodeVerifierCache()) { request ->
+            when (request.url.pathAfterVersion()) {
+                "/logout" -> respondJson(Unit)
+                "/user" -> {
+                    assertEquals(HttpMethod.Get, request.method)
+                    assertTrue(request.headers["Authorization"] == "Bearer ${candidate.accessToken}")
+                    lookups++
+                    entered.complete(Unit)
+                    release.await()
+                    respondJson(requireNotNull(candidate.user))
+                }
+                else -> error("Unexpected recovery lookup request")
+            }
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            auth.importSession(session("A"), source = SessionSource.External)
+            auth.parseFragmentAndImportSession(recoveryFragment(candidate)) { callbacks++ }
+            if (!queued) {
+                runCurrent()
+                assertTrue(entered.isCompleted && callbacks == 0)
+            } else assertFalse(entered.isCompleted)
+            changeAsyncAuthority(auth, boundary)
+            runCurrent()
+            assertTrue(entered.isCompleted)
+            val recoveryJob = requireNotNull(auth.authScope.coroutineContext[kotlinx.coroutines.Job]).children.single { it.isActive }
+            val status = auth.sessionStatus.value
+            val expected = asyncReplacement(boundary)
+            assertAsyncAuthority(auth, storage, expected, status)
+            release.complete(Unit)
+            runCurrent()
+            assertTrue(lookups == 1 && callbacks == 0)
+            assertTrue(recoveryJob.isCompleted && !recoveryJob.isCancelled)
+            assertAsyncAuthority(auth, storage, expected, status)
+            assertFalse(auth.isAutoRefreshRunning)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun staleUserUpdateErrorCannotClearNewAccount() = errorCleanupBoundary(AsyncBoundary.NEW_ACCOUNT)
+
+    @Test
+    fun staleUserUpdateErrorCannotClearSameAccountRelogin() = errorCleanupBoundary(AsyncBoundary.RELOGIN)
+
+    @Test
+    fun currentUserUpdateSessionMissingErrorStillClearsSession() = errorCleanupBoundary(AsyncBoundary.CURRENT)
+
+    @Test
+    fun currentUserLookupSessionMissingErrorStillClearsSession() = errorCleanupBoundary(AsyncBoundary.CURRENT, lookup = true)
+
+    @Test
+    fun customUserCredentialErrorCannotClearUnrelatedSession() = errorCleanupBoundary(AsyncBoundary.CURRENT, lookup = true, unrelated = true)
+
+    @Test
+    fun unknownRefreshTokenErrorCannotClearCurrentSession() = errorCleanupBoundary(AsyncBoundary.CURRENT, refresh = true, unrelated = true)
+
+    @Test
+    fun currentExplicitRefreshTokenErrorStillClearsSession() = errorCleanupBoundary(AsyncBoundary.CURRENT, refresh = true)
+
+    @Test
+    fun otpErrorCannotClearUnrelatedCurrentSession() = errorCleanupBoundary(AsyncBoundary.CURRENT, otp = true, unrelated = true)
+
+    private fun errorCleanupBoundary(
+        boundary: AsyncBoundary,
+        lookup: Boolean = false,
+        refresh: Boolean = false,
+        otp: Boolean = false,
+        unrelated: Boolean = false
+    ) = runTest(timeout = 30.seconds) {
+        val original = session("A")
+        val credential = if (unrelated) session("B") else original
+        val storage = MemorySessionManager()
+        val cache = MemoryCodeVerifierCache("sdk002-old-verifier")
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var requests = 0
+        val client = controlledClient(storage, autoRefresh = true, codeVerifierCache = cache) { request ->
+            if (request.url.pathAfterVersion() == "/logout") respondJson(Unit)
+            else {
+                assertEquals(if (refresh) "/token" else if (otp) "/verify" else "/user", request.url.pathAfterVersion())
+                assertEquals(if (lookup) HttpMethod.Get else if (refresh || otp) HttpMethod.Post else HttpMethod.Put, request.method)
+                if (refresh) {
+                    assertTrue(request.body.toJsonElement().jsonObject["refresh_token"]?.jsonPrimitive?.content == credential.refreshToken)
+                } else assertTrue(request.headers["Authorization"] == "Bearer ${if (otp) original.accessToken else credential.accessToken}")
+                requests++
+                entered.complete(Unit)
+                release.await()
+                respondError(HttpStatusCode.BadRequest, """{"error_code":"session_not_found"}""")
+            }
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            auth.importSession(original, source = SessionSource.External)
+            val operation = async {
+                runCatching {
+                    when {
+                        refresh -> auth.refreshSession(credential.refreshToken)
+                        otp -> auth.verifyEmailOtp(OtpType.Email.RECOVERY, tokenHash = "sdk002-unrelated-recovery-token")
+                        lookup -> auth.retrieveUser(credential.accessToken)
+                        else -> auth.updateUser { email = "updated-a@example.invalid" }
+                    }
+                }
+            }
+            runCurrent()
+            assertTrue(entered.isCompleted && !operation.isCompleted)
+            changeAsyncAuthority(auth, boundary)
+            cache.saveCodeVerifier("sdk002-current-verifier")
+            val status = auth.sessionStatus.value
+            val job = auth.sessionJob
+            val information = auth.autoRefreshInformation()
+            release.complete(Unit)
+            runCurrent()
+            assertTrue(operation.isCompleted && requests == 1)
+            assertIs<AuthSessionMissingException>(operation.await().exceptionOrNull())
+            if (boundary == AsyncBoundary.CURRENT && !unrelated) {
+                assertIs<SessionStatus.NotAuthenticated>(auth.sessionStatus.value)
+                assertNull(auth.currentSessionOrNull())
+                assertNull(storage.loadSessionOrNull())
+                assertNull(cache.loadCodeVerifier())
+                assertFalse(auth.isAutoRefreshRunning)
+            } else {
+                assertAsyncAuthority(auth, storage, asyncReplacement(boundary), status)
+                assertTrue(auth.sessionJob === job && auth.autoRefreshInformation() == information)
+                assertTrue(auth.isAutoRefreshRunning)
+                assertTrue(cache.loadCodeVerifier() == "sdk002-current-verifier")
+            }
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun currentUserLookupCommitsMatchingIdentity() = userLookupBoundary(AsyncBoundary.CURRENT)
+
+    @Test
+    fun staleUserLookupCannotOverwriteNewAccount() = userLookupBoundary(AsyncBoundary.NEW_ACCOUNT)
+
+    @Test
+    fun staleUserLookupCannotOverwriteSameAccountRelogin() = userLookupBoundary(AsyncBoundary.RELOGIN)
+
+    @Test
+    fun staleUserLookupCannotRestoreSignedOutSession() = userLookupBoundary(AsyncBoundary.SIGN_OUT)
+
+    @Test
+    fun userLookupWithoutLocalUpdatePreservesSession() = userLookupBoundary(AsyncBoundary.CURRENT, update = false)
+
+    @Test
+    fun mismatchedUserLookupCannotPolluteCurrentSession() = userLookupBoundary(AsyncBoundary.CURRENT, mismatched = true)
+
+    private fun userLookupBoundary(boundary: AsyncBoundary, update: Boolean = true, mismatched: Boolean = false) = runTest(timeout = 30.seconds) {
+        val original = session("A")
+        val user = requireNotNull(if (mismatched) session("B").user else original.user).copy(email = "queried@example.invalid")
+        val storage = MemorySessionManager()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var lookups = 0
+        val client = controlledClient(storage, autoRefresh = true, codeVerifierCache = MemoryCodeVerifierCache()) { request ->
+            if (request.url.pathAfterVersion() == "/logout") respondJson(Unit)
+            else {
+                assertEquals("/user", request.url.pathAfterVersion())
+                assertEquals(HttpMethod.Get, request.method)
+                assertTrue(request.headers["Authorization"] == "Bearer ${original.accessToken}")
+                lookups++
+                entered.complete(Unit)
+                release.await()
+                respondJson(user)
+            }
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            auth.importSession(original, source = SessionSource.External)
+            val lookup = async { auth.retrieveUserForCurrentSession(updateSession = update) }
+            runCurrent()
+            assertTrue(entered.isCompleted && !lookup.isCompleted)
+            changeAsyncAuthority(auth, boundary)
+            val status = auth.sessionStatus.value
+            val job = auth.sessionJob
+            val information = auth.autoRefreshInformation()
+            release.complete(Unit)
+            runCurrent()
+            assertTrue(lookup.isCompleted && lookups == 1)
+            assertTrue(lookup.await() == user)
+            if (boundary == AsyncBoundary.CURRENT && update && !mismatched) {
+                val expected = original.copy(user = user)
+                assertTrue(auth.currentSessionOrNull() == expected && storage.loadSessionOrNull() == expected)
+                assertIs<SessionSource.UserChanged>(assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value).source)
+                assertTrue(job?.isCancelled == true && auth.sessionJob !== job && auth.isAutoRefreshRunning)
+            } else {
+                assertAsyncAuthority(auth, storage, asyncReplacement(boundary), status)
+                assertTrue(auth.sessionJob === job && auth.autoRefreshInformation() == information)
+            }
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun delayedLogoutCannotDeleteNewAccount() = logoutAuthorityBoundary(AsyncBoundary.NEW_ACCOUNT)
+
+    @Test
+    fun delayedLogoutCannotDeleteSameAccountRelogin() = logoutAuthorityBoundary(AsyncBoundary.RELOGIN)
+
+    @Test
+    fun normalLogoutDeletesSessionAndVerifier() = logoutAuthorityBoundary(AsyncBoundary.CURRENT)
+
+    @Test
+    fun globalLogoutDeletesSessionAndVerifier() = logoutAuthorityBoundary(AsyncBoundary.CURRENT, scope = SignOutScope.GLOBAL)
+
+    @Test
+    fun logoutOthersPreservesLocalSession() = logoutAuthorityBoundary(AsyncBoundary.CURRENT, scope = SignOutScope.OTHERS)
+
+    @Test
+    fun ignoredLogoutErrorRespectsOthersScope() = logoutAuthorityBoundary(AsyncBoundary.CURRENT, scope = SignOutScope.OTHERS, ignoredError = true)
+
+    @Test
+    fun ignoredLogoutErrorStillClearsLocalAuthority() = logoutAuthorityBoundary(AsyncBoundary.CURRENT, ignoredError = true)
+
+    private fun logoutAuthorityBoundary(
+        boundary: AsyncBoundary,
+        scope: SignOutScope = SignOutScope.LOCAL,
+        ignoredError: Boolean = false
+    ) = runTest(timeout = 30.seconds) {
+        val original = session("A")
+        val storage = MemorySessionManager()
+        val cache = MemoryCodeVerifierCache("sdk002-old-verifier")
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var requests = 0
+        val client = controlledClient(storage, autoRefresh = true, codeVerifierCache = cache) { request ->
+            assertEquals("/logout", request.url.pathAfterVersion())
+            assertEquals(HttpMethod.Post, request.method)
+            assertTrue(request.headers["Authorization"] == "Bearer ${original.accessToken}")
+            assertEquals(scope.name.lowercase(), request.url.parameters["scope"])
+            requests++
+            entered.complete(Unit)
+            release.await()
+            if (ignoredError) respondError(HttpStatusCode.Unauthorized, """{"error_code":"session_not_found"}""")
+            else respondJson(Unit)
+        }
+        try {
+            runCurrent()
+            val auth = client.auth as AuthImpl
+            auth.awaitInitialization()
+            auth.importSession(original, source = SessionSource.External)
+            val logout = async { auth.signOut(scope) }
+            runCurrent()
+            assertTrue(entered.isCompleted && !logout.isCompleted)
+            if (boundary != AsyncBoundary.CURRENT) {
+                // A returned login establishes fresh authority even for the same account.
+                auth.importSession(requireNotNull(asyncReplacement(boundary)), source = SessionSource.External)
+                cache.saveCodeVerifier("sdk002-new-flow-verifier")
+            }
+            val status = auth.sessionStatus.value
+            val job = auth.sessionJob
+            val information = auth.autoRefreshInformation()
+            release.complete(Unit)
+            runCurrent()
+            assertTrue(logout.isCompleted && requests == 1)
+            logout.await()
+            if (boundary == AsyncBoundary.CURRENT && scope != SignOutScope.OTHERS) {
+                assertIs<SessionStatus.NotAuthenticated>(auth.sessionStatus.value)
+                assertNull(auth.currentSessionOrNull())
+                assertNull(storage.loadSessionOrNull())
+                assertNull(cache.loadCodeVerifier())
+                assertTrue(job?.isCancelled == true && !auth.isAutoRefreshRunning)
+            } else {
+                assertAsyncAuthority(auth, storage, asyncReplacement(boundary), status)
+                assertTrue(auth.sessionJob === job && auth.autoRefreshInformation() == information && auth.isAutoRefreshRunning)
+                assertTrue(cache.loadCodeVerifier() == if (boundary == AsyncBoundary.CURRENT) "sdk002-old-verifier" else "sdk002-new-flow-verifier")
+            }
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun oldLogoutPreservesNewPkceFlowVerifier() = logoutVerifierBoundary(queuedSave = false)
+
+    @Test
+    fun queuedPkceVerifierWriteSurvivesOlderLogout() = logoutVerifierBoundary(queuedSave = true)
+
+    @Test
+    fun pkceFlowRegisteredDuringLogoutCleanupKeepsVerifier() = verifierCleanupHandoff(pkce = false)
+
+    @Test
+    fun pkceFlowRegisteredDuringExchangeCleanupKeepsVerifier() = verifierCleanupHandoff(pkce = true)
+
+    private fun verifierCleanupHandoff(pkce: Boolean) = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        val delegate = MemoryCodeVerifierCache("sdk002-old-verifier")
+        var loads = 0
+        var deletions = 0
+        lateinit var client: SupabaseClient
+        val cache = object : CodeVerifierCache by delegate {
+            override suspend fun loadCodeVerifier(): String? {
+                val snapshot = delegate.loadCodeVerifier()
+                if (++loads == 2) {
+                    // Register a new flow after the operation captured its old verifier, while
+                    // cleanup is reading it. The queued save must run after the lock exits.
+                    client.auth.getOAuthUrl(Google, redirectUrl = "https://example.invalid/callback")
+                }
+                return snapshot
+            }
+            override suspend fun deleteCodeVerifier() {
+                deletions++
+                delegate.deleteCodeVerifier()
+            }
+        }
+        client = controlledClient(storage, codeVerifierCache = cache) {
+            assertEquals(if (pkce) "/token" else "/logout", it.url.pathAfterVersion())
+            if (pkce) respondJson(session("A").copy(accessToken = "sdk002-exchanged-access")) else respondJson(Unit)
+        }
+        try {
+            runCurrent()
+            client.auth.awaitInitialization()
+            client.auth.importSession(session("A"), source = SessionSource.External)
+            client.auth.config.flowType = FlowType.PKCE
+            val operation = async {
+                runCatching {
+                    if (pkce) client.auth.exchangeCodeForSession("sdk002-old-auth-code") else client.auth.signOut()
+                }
+            }
+            runCurrent()
+            assertTrue(operation.isCompleted)
+            if (pkce) assertIs<CancellationException>(operation.await().exceptionOrNull())
+            else assertTrue(operation.await().isSuccess)
+            assertTrue(loads == 2 && deletions == 0)
+            val verifier = delegate.loadCodeVerifier()
+            assertTrue(verifier != null && verifier != "sdk002-old-verifier")
+            val expected = if (pkce) session("A") else null
+            assertTrue(client.auth.currentSessionOrNull() == expected)
+            assertTrue(storage.loadSessionOrNull() == expected)
+        } finally {
+            client.close()
+        }
+    }
+
+    private fun logoutVerifierBoundary(queuedSave: Boolean) = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        val cache = MemoryCodeVerifierCache("sdk002-old-verifier")
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val client = controlledClient(storage, codeVerifierCache = cache) {
+            assertEquals("/logout", it.url.pathAfterVersion())
+            entered.complete(Unit)
+            release.await()
+            respondJson(Unit)
+        }
+        try {
+            runCurrent()
+            val auth = client.auth
+            auth.awaitInitialization()
+            auth.importSession(session("A"), source = SessionSource.External)
+            val logout = async { auth.signOut() }
+            runCurrent()
+            assertTrue(entered.isCompleted && !logout.isCompleted)
+            auth.config.flowType = FlowType.PKCE
+            // Queue the old logout continuation before the new verifier save, if requested.
+            // Neither continuation executes until runCurrent; PKCE ownership must be registered now.
+            if (queuedSave) release.complete(Unit)
+            val url = auth.getOAuthUrl(Google, redirectUrl = "https://example.invalid/callback")
+            assertTrue(url.contains("code_challenge="))
+            if (!queuedSave) {
+                runCurrent()
+                assertTrue(cache.loadCodeVerifier() != "sdk002-old-verifier")
+                assertFalse(logout.isCompleted)
+                release.complete(Unit)
+            }
+            runCurrent()
+            assertTrue(logout.isCompleted)
+            logout.await()
+            val verifier = cache.loadCodeVerifier()
+            assertTrue(verifier != null && verifier != "sdk002-old-verifier")
+            assertNull(auth.currentSessionOrNull())
+            assertNull(storage.loadSessionOrNull())
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun currentOtpVerificationStillImports() = authenticationResponseBoundary(AsyncBoundary.CURRENT, pkce = false)
+
+    @Test
+    fun otpVerificationCannotImportAcrossAccountSwitch() = authenticationResponseBoundary(AsyncBoundary.NEW_ACCOUNT, pkce = false)
+
+    @Test
+    fun otpVerificationCannotImportAfterLogout() = authenticationResponseBoundary(AsyncBoundary.SIGN_OUT, pkce = false)
+
+    @Test
+    fun otpVerificationCannotImportAfterSameAccountRelogin() = authenticationResponseBoundary(AsyncBoundary.RELOGIN, pkce = false)
+
+    @Test
+    fun currentPkceExchangeStillImports() = authenticationResponseBoundary(AsyncBoundary.CURRENT, pkce = true)
+
+    @Test
+    fun pkceExchangeCannotImportAcrossAccountSwitch() = authenticationResponseBoundary(AsyncBoundary.NEW_ACCOUNT, pkce = true)
+
+    @Test
+    fun pkceExchangeCannotImportAfterLogout() = authenticationResponseBoundary(AsyncBoundary.SIGN_OUT, pkce = true)
+
+    @Test
+    fun pkceExchangeCannotImportAfterSameAccountRelogin() = authenticationResponseBoundary(AsyncBoundary.RELOGIN, pkce = true)
+
+    @Test
+    fun readOnlyPkceExchangePreservesNewAuthorityAndVerifier() = authenticationResponseBoundary(AsyncBoundary.NEW_ACCOUNT, pkce = true, save = false)
+
+    @Test
+    fun oldPkceExchangeCannotConsumeNewFlowVerifier() = authenticationResponseBoundary(AsyncBoundary.CURRENT, pkce = true, replaceVerifier = true)
+
+    private fun authenticationResponseBoundary(
+        boundary: AsyncBoundary,
+        pkce: Boolean,
+        save: Boolean = true,
+        replaceVerifier: Boolean = false
+    ) = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        val cache = MemoryCodeVerifierCache("sdk002-exchange-verifier")
+        val candidate = session("A").copy(accessToken = "sdk002-verified-access-A", refreshToken = "sdk002-verified-refresh-A")
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var requests = 0
+        val client = controlledClient(storage, codeVerifierCache = cache) { request ->
+            if (request.url.pathAfterVersion() == "/logout") respondJson(Unit)
+            else {
+                assertEquals(HttpMethod.Post, request.method)
+                assertEquals(if (pkce) "/token" else "/verify", request.url.pathAfterVersion())
+                val body = request.body.toJsonElement().jsonObject
+                if (pkce) {
+                    assertEquals("pkce", request.url.parameters["grant_type"])
+                    assertTrue(body["code_verifier"]?.jsonPrimitive?.content == "sdk002-exchange-verifier")
+                } else assertTrue(body["token_hash"]?.jsonPrimitive?.content == "sdk002-recovery-token")
+                requests++
+                entered.complete(Unit)
+                release.await()
+                respondJson(candidate)
+            }
+        }
+        try {
+            runCurrent()
+            val auth = client.auth
+            auth.awaitInitialization()
+            auth.importSession(session("A"), source = SessionSource.External)
+            val operation = async {
+                runCatching {
+                    if (pkce) auth.exchangeCodeForSession("sdk002-auth-code", saveSession = save)
+                    else auth.verifyEmailOtp(OtpType.Email.RECOVERY, tokenHash = "sdk002-recovery-token")
+                }
+            }
+            runCurrent()
+            assertTrue(entered.isCompleted && !operation.isCompleted)
+            changeAsyncAuthority(auth, boundary)
+            if (replaceVerifier) {
+                auth.config.flowType = FlowType.PKCE
+                auth.getOAuthUrl(Google, redirectUrl = "https://example.invalid/callback")
+                runCurrent()
+            } else if (boundary != AsyncBoundary.CURRENT) cache.saveCodeVerifier("sdk002-next-verifier")
+            val verifier = cache.loadCodeVerifier()
+            val status = auth.sessionStatus.value
+            release.complete(Unit)
+            runCurrent()
+            assertTrue(operation.isCompleted && requests == 1)
+            val result = operation.await()
+            if (boundary == AsyncBoundary.CURRENT && !replaceVerifier) {
+                assertTrue(result.isSuccess)
+                if (pkce) {
+                    assertTrue(result.getOrThrow() == candidate)
+                    assertNull(cache.loadCodeVerifier())
+                } else assertTrue(assertIs<OtpVerifyResult.Authenticated>(result.getOrThrow()).session == candidate)
+                assertTrue(auth.currentSessionOrNull() == candidate && storage.loadSessionOrNull() == candidate)
+            } else {
+                if (!pkce || save) assertIs<CancellationException>(result.exceptionOrNull())
+                else assertTrue(result.getOrThrow() == candidate)
+                assertAsyncAuthority(auth, storage, asyncReplacement(boundary), status)
+                assertTrue(cache.loadCodeVerifier() == verifier)
+            }
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun authLogsOmitSessionAndRecoveryCredentials() = credentialLogs(failedLookup = false)
+
+    @Test
+    fun failedRecoveryLookupDoesNotLogCredential() = credentialLogs(failedLookup = true)
+
+    @Test
+    fun refreshTransportFailureDoesNotLogCredentials() = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        val logs = mutableListOf<String>()
+        val secret = "sdk002-sensitive-transport-credential"
+        var requests = 0
+        val client = controlledClient(storage, autoRefresh = true, codeVerifierCache = MemoryCodeVerifierCache(), logs = logs) {
+            requests++
+            throw IllegalStateException("Synthetic transport failure containing $secret")
+        }
+        try {
+            runCurrent()
+            client.auth.awaitInitialization()
+            val before = session("B")
+            client.auth.importSession(before, autoRefresh = false, source = SessionSource.External)
+            client.auth.importSession(session("A").copy(expiresIn = 0, expiresAt = Instant.fromEpochMilliseconds(0)))
+            runCurrent()
+            assertTrue(requests == 1)
+            assertIs<SessionStatus.RefreshFailure>(client.auth.sessionStatus.value)
+            assertTrue(storage.loadSessionOrNull() == before)
+            assertTrue(logs.any { it.contains("Couldn't reach Supabase") })
+            assertFalse(logs.any { it.contains(secret) }, "Auth failure log contains a synthetic credential")
+        } finally {
+            client.close()
+        }
+    }
+
+    private fun credentialLogs(failedLookup: Boolean) = runTest(timeout = 30.seconds) {
+        val storage = MemorySessionManager()
+        val cache = MemoryCodeVerifierCache("sdk002-sensitive-pkce-verifier")
+        val logs = mutableListOf<String>()
+        val original = session("A")
+        val refreshed = original.copy(accessToken = "sdk002-sensitive-renewed-access", refreshToken = "sdk002-sensitive-renewed-refresh")
+        var callbacks = 0
+        val client = controlledClient(storage, codeVerifierCache = cache, logs = logs) { request ->
+            when (request.url.pathAfterVersion()) {
+                "/user" -> if (failedLookup) respondError(HttpStatusCode.Unauthorized, "{}") else respondJson(requireNotNull(original.user))
+                "/token" -> respondJson(refreshed)
+                else -> error("Unexpected request during logging observation")
+            }
+        }
+        try {
+            runCurrent()
+            val auth = client.auth
+            auth.awaitInitialization()
+            auth.importSession(original, source = SessionSource.External)
+            auth.parseFragmentAndImportSession(recoveryFragment(original)) { callbacks++ }
+            runCurrent()
+            assertTrue(callbacks == if (failedLookup) 0 else 1)
+            if (failedLookup) assertTrue(logs.any { it.contains("Couldn't retrieve user using the supplied credential") })
+            else {
+                auth.refreshCurrentSession()
+                assertTrue(auth.currentSessionOrNull() == refreshed && storage.loadSessionOrNull() == refreshed)
+                auth.exchangeCodeForSession("sdk002-sensitive-recovery-code", saveSession = false)
+            }
+            assertTrue(logs.isNotEmpty())
+            val secrets = listOf(original.accessToken, original.refreshToken, refreshed.accessToken, refreshed.refreshToken,
+                "sdk002-sensitive-pkce-verifier", "sdk002-sensitive-recovery-code")
+            assertFalse(logs.any { message -> secrets.any { secret -> message.contains(secret) } }, "Auth log contains a synthetic credential")
+        } finally {
+            client.close()
+        }
+    }
+
     private fun TestScope.controlledClient(
         storage: SessionManager,
         requireSession: Boolean = false,
@@ -1086,11 +1694,20 @@ class Sdk002IdentityRaceTest {
         scope: CoroutineScope? = null,
         codeVerifierCache: CodeVerifierCache? = null,
         onMockEngine: ((MockEngine) -> Unit)? = null,
+        logs: MutableList<String>? = null,
         handler: MockRequestHandler
     ): SupabaseClient {
         val testDispatcher = StandardTestDispatcher(testScheduler)
         return createMockedSupabaseClient(configuration = {
-            defaultLogLevel = LogLevel.NONE
+            defaultLogLevel = if (logs == null) LogLevel.NONE else LogLevel.DEBUG
+            if (logs != null) defaultLoggingFactory = {
+                object : SupabaseLoggingProcessor {
+                    override fun isEnabled(level: LogLevel) = true
+                    override fun processLog(level: LogLevel, tag: String, throwable: Throwable?, message: String) {
+                        if (tag.contains(Auth.LOGGING_TAG)) logs.add(message + throwable?.stackTraceToString().orEmpty())
+                    }
+                }
+            }
             coroutineDispatcher = testDispatcher
             val engine = MockEngine(MockEngineConfig().apply {
                 dispatcher = testDispatcher

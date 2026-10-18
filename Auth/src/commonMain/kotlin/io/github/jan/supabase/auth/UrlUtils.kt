@@ -16,11 +16,12 @@ fun Auth.parseFragmentAndImportSession(fragment: String, onFinish: (UserSession?
         return
     }
     val session = res.session
+    val auth = this as AuthImpl
+    val generation = auth.captureSessionGeneration()
     authScope.launch {
-        val user = tryToGetUser(session.accessToken) ?: return@launch
+        val user = auth.withSessionGeneration(generation) { tryToGetUser(session.accessToken) } ?: return@launch
         val newSession = session.copy(user = user)
-        val result = (this@parseFragmentAndImportSession as AuthImpl)
-            .importSessionWithAcknowledgement(newSession, source = SessionSource.External)
+        val result = auth.importSessionWithAcknowledgement(newSession, source = SessionSource.External, expectedGeneration = generation)
         if (result is SessionImportResult.Committed) onFinish(result.session)
     }
 }

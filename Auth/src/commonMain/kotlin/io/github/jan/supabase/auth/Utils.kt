@@ -27,6 +27,6 @@ internal suspend fun Auth.tryToGetUser(accessToken: String) = try {
     retrieveUser(accessToken)
 } catch (e: Exception) {
     currentCoroutineContext().ensureActive()
-    logger.e(e) { "Couldn't retrieve user using access token $accessToken.\nIf you use the project secret, ignore this message." }
+    logger.e { "Couldn't retrieve user using the supplied credential (${e::class.simpleName})." }
     null
 }

@@ -6,7 +6,6 @@ import io.github.jan.supabase.buildUrl
 import io.github.jan.supabase.logging.d
 
 internal fun Auth.validateHash(hash: String): UrlValidationResult {
-    logger.d { "Parsing fragment/hash $hash" }
     val parameters = getFragmentParts(hash)
     if(handledUrlParameterError { parameters[it] }) {
         return UrlValidationResult.ErrorFound
