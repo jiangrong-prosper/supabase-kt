@@ -20,6 +20,7 @@ import io.github.jan.supabase.testing.pathAfterVersion
 import io.github.jan.supabase.testing.respondJson
 import io.github.jan.supabase.testing.toJsonElement
 import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.MockEngineConfig
 import io.ktor.client.engine.mock.MockRequestHandler
 import io.ktor.client.engine.mock.respondError
 import io.ktor.http.HttpMethod
@@ -1091,10 +1092,10 @@ class Sdk002IdentityRaceTest {
         return createMockedSupabaseClient(configuration = {
             defaultLogLevel = LogLevel.NONE
             coroutineDispatcher = testDispatcher
-            val engine = MockEngine.create {
+            val engine = MockEngine(MockEngineConfig().apply {
                 dispatcher = testDispatcher
                 addHandler(handler)
-            }
+            })
             onMockEngine?.invoke(engine)
             httpEngine = engine
             install(Auth) {
