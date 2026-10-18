@@ -1,6 +1,8 @@
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.auth.AuthImpl
+import io.github.jan.supabase.auth.CodeVerifierCache
+import io.github.jan.supabase.auth.MemoryCodeVerifierCache
 import io.github.jan.supabase.auth.MemorySessionManager
 import io.github.jan.supabase.auth.SessionManager
 import io.github.jan.supabase.auth.SessionImportResult
@@ -412,7 +414,12 @@ class Sdk002IdentityRaceTest {
             // The response alone is insufficient: save is suspended and publication has
             // not happened. A callback/receipt at this point would be a false positive.
             assertTrue(saveEntered.isCompleted)
-            assertIs<SessionStatus.RefreshFailure>(auth.sessionStatus.value)
+            if (boundary in listOf(RecoveryBoundary.RETRY, RecoveryBoundary.NETWORK_RETRY)) {
+                assertIs<SessionStatus.RefreshFailure>(auth.sessionStatus.value)
+            } else {
+                val pendingStatus = assertIs<SessionStatus.Authenticated>(auth.sessionStatus.value)
+                assertTrue(pendingStatus.session == before && pendingStatus.source == SessionSource.External)
+            }
             assertTrue(storage.loadSessionOrNull() == before && saved == before)
             assertFalse(callback.isCompleted)
             assertTrue(receipt?.isCompleted != true)
@@ -881,14 +888,39 @@ class Sdk002IdentityRaceTest {
         )
         val overrideToken = if (boundary == UpdateBoundary.OVERRIDE_TOKEN) "sdk002-override-access-A" else null
         val storage = MemorySessionManager()
+        val sessionDeleteEntered = CompletableDeferred<Unit>()
+        val sessionDeleteCompleted = CompletableDeferred<Unit>()
+        val verifierDeleteEntered = CompletableDeferred<Unit>()
+        val verifierDeleteCompleted = CompletableDeferred<Unit>()
+        val verifierDelegate = MemoryCodeVerifierCache()
+        val verifierCache = object : CodeVerifierCache by verifierDelegate {
+            override suspend fun deleteCodeVerifier() {
+                verifierDeleteEntered.complete(Unit)
+                verifierDelegate.deleteCodeVerifier()
+                verifierDeleteCompleted.complete(Unit)
+            }
+        }
+        val observedStorage = object : SessionManager by storage {
+            override suspend fun deleteSession() {
+                sessionDeleteEntered.complete(Unit)
+                storage.deleteSession()
+                sessionDeleteCompleted.complete(Unit)
+            }
+        }
         val requestEntered = CompletableDeferred<String?>()
         val releaseResponse = CompletableDeferred<Unit>()
         val logoutEntered = CompletableDeferred<Unit>()
         val logoutResponseReturned = CompletableDeferred<Unit>()
+        lateinit var mockEngine: MockEngine
         var updates = 0
         var refreshes = 0
         var logouts = 0
-        val client = controlledClient(storage, jwtToken = overrideToken) { request ->
+        val client = controlledClient(
+            observedStorage,
+            jwtToken = overrideToken,
+            codeVerifierCache = verifierCache,
+            onMockEngine = { mockEngine = it }
+        ) { request ->
             when (request.url.pathAfterVersion()) {
                 "/user" -> {
                     assertEquals(HttpMethod.Put, request.method)
@@ -940,7 +972,42 @@ class Sdk002IdentityRaceTest {
                     runCurrent()
                     assertTrue(logoutEntered.isCompleted, "signOut did not enter /logout handler; responseReturned=${logoutResponseReturned.isCompleted}, completed=${logout.isCompleted}")
                     assertTrue(logoutResponseReturned.isCompleted, " /logout handler did not return its response; completed=${logout.isCompleted}")
-                    assertTrue(logout.isCompleted, "/logout response returned but signOut is still suspended")
+                    runCurrent()
+                    val responseRecorded = mockEngine.responseHistory.isNotEmpty()
+                    println(
+                        "SDK002 logout diagnostic: boundary=while-user-response-blocked; handlerEntered=${logoutEntered.isCompleted}; " +
+                            "handlerResponseGenerated=${logoutResponseReturned.isCompleted}; responseHistoryRecorded=$responseRecorded; " +
+                            "cleanupEntered=${verifierDeleteEntered.isCompleted || sessionDeleteEntered.isCompleted}; " +
+                            "verifierDeleteEntered=${verifierDeleteEntered.isCompleted}; verifierDeleteCompleted=${verifierDeleteCompleted.isCompleted}; " +
+                            "sessionDeleteEntered=${sessionDeleteEntered.isCompleted}; sessionDeleteCompleted=${sessionDeleteCompleted.isCompleted}; " +
+                            "signOutCompleted=${logout.isCompleted}; lastConfirmed=" + when {
+                                logout.isCompleted -> "signOut-complete"
+                                sessionDeleteCompleted.isCompleted -> "session-deletion-complete"
+                                sessionDeleteEntered.isCompleted -> "session-deletion-entered"
+                                verifierDeleteCompleted.isCompleted -> "verifier-deletion-complete"
+                                verifierDeleteEntered.isCompleted -> "verifier-deletion-entered"
+                                responseRecorded -> "response-history-recorded"
+                                logoutResponseReturned.isCompleted -> "handler-response-generated"
+                                logoutEntered.isCompleted -> "handler-entered"
+                                else -> "unknown"
+                            } + "; unknownStages=" + when {
+                                logout.isCompleted -> "none"
+                                sessionDeleteEntered.isCompleted && !sessionDeleteCompleted.isCompleted -> "session-deletion-completion,signOut-completion"
+                                sessionDeleteCompleted.isCompleted -> "signOut-completion"
+                                verifierDeleteEntered.isCompleted && !verifierDeleteCompleted.isCompleted -> "verifier-deletion-completion,session-deletion,signOut-completion"
+                                verifierDeleteCompleted.isCompleted -> "session-deletion,signOut-completion"
+                                responseRecorded -> "cleanup,verifier-deletion,session-deletion,signOut-completion"
+                                logoutResponseReturned.isCompleted -> "response-history,cleanup,verifier-deletion,session-deletion,signOut-completion"
+                                logoutEntered.isCompleted -> "handler-response,response-history,cleanup,verifier-deletion,session-deletion,signOut-completion"
+                                else -> "handler-entry,response-history,cleanup,verifier-deletion,session-deletion,signOut-completion"
+                            }
+                    )
+                    assertTrue(responseRecorded, "MockEngine did not record the /logout response")
+                    assertTrue(
+                        logout.isCompleted,
+                        "/logout response recorded but signOut is still suspended; cleanupEntered=${verifierDeleteEntered.isCompleted || sessionDeleteEntered.isCompleted}, " +
+                            "verifierDeleteCompleted=${verifierDeleteCompleted.isCompleted}, sessionDeleteCompleted=${sessionDeleteCompleted.isCompleted}"
+                    )
                     logout.await()
                     assertNull(client.auth.currentSessionOrNull())
                     assertNull(storage.loadSessionOrNull())
@@ -1016,18 +1083,23 @@ class Sdk002IdentityRaceTest {
         jwtToken: String? = null,
         autoRefresh: Boolean = false,
         scope: CoroutineScope? = null,
+        codeVerifierCache: CodeVerifierCache? = null,
+        onMockEngine: ((MockEngine) -> Unit)? = null,
         handler: MockRequestHandler
     ): SupabaseClient {
         val testDispatcher = StandardTestDispatcher(testScheduler)
         return createMockedSupabaseClient(configuration = {
             defaultLogLevel = LogLevel.NONE
             coroutineDispatcher = testDispatcher
-            httpEngine = MockEngine.create {
+            val engine = MockEngine.create {
                 dispatcher = testDispatcher
                 addHandler(handler)
             }
+            onMockEngine?.invoke(engine)
+            httpEngine = engine
             install(Auth) {
                 sessionManager = storage
+                codeVerifierCache?.let { this.codeVerifierCache = it }
                 autoLoadFromStorage = false
                 autoSaveToStorage = true
                 alwaysAutoRefresh = autoRefresh
